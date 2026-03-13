@@ -14,111 +14,83 @@ import { color } from "../constants/tailwind";
 const safeData = [
   {
     time: "18:00",
-    flow_sensor1: 0.5,
-    setpoint_sensor1: 0.4,
-    flow_sensor2: 0.3,
-    setpoint_sensor2: 0.2,
+    sniffer: 0.5,
+    purway: 0.4,
   },
   {
     time: "18:10",
-    flow_sensor1: 1.8,
-    setpoint_sensor1: 1.4,
-    flow_sensor2: 1.4,
-    setpoint_sensor2: 1.1,
+    sniffer: 1.8,
+    purway: 1.4,
   },
   {
     time: "18:18",
-    flow_sensor1: 4.6,
-    setpoint_sensor1: 3.9,
-    flow_sensor2: 3.8,
-    setpoint_sensor2: 3.2,
+    sniffer: 4.6,
+    purway: 3.9,
   },
   {
     time: "18:24",
-    flow_sensor1: 6.8,
-    setpoint_sensor1: 5.6,
-    flow_sensor2: 5.1,
-    setpoint_sensor2: 4.4,
+    sniffer: 6.8,
+    purway: 5.6,
   },
   {
     time: "18:30",
-    flow_sensor1: 8.5,
-    setpoint_sensor1: 7.1,
-    flow_sensor2: 6.3,
-    setpoint_sensor2: 5.2,
+    sniffer: 8.5,
+    purway: 7.1,
   },
   {
     time: "18:38",
-    flow_sensor1: 10.2,
-    setpoint_sensor1: 8.7,
-    flow_sensor2: 7.5,
-    setpoint_sensor2: 6.0,
+    sniffer: 10.2,
+    purway: 8.7,
+    
   },
   {
     time: "18:46",
-    flow_sensor1: 11.4,
-    setpoint_sensor1: 9.8,
-    flow_sensor2: 8.4,
-    setpoint_sensor2: 6.8,
+    sniffer: 11.4,
+    purway: 9.8,
   },
   {
     time: "19:00",
-    flow_sensor1: 11.6,
-    setpoint_sensor1: 10.0,
-    flow_sensor2: 8.8,
-    setpoint_sensor2: 7.1,
+    sniffer: 11.6,
+    purway: 10.0,
   },
   {
     time: "19:30",
-    flow_sensor1: 11.6,
-    setpoint_sensor1: 10.0,
-    flow_sensor2: 8.8,
-    setpoint_sensor2: 7.1,
+    sniffer: 11.6,
+    purway: 10.0,
   },
   {
     time: "20:00",
-    flow_sensor1: 11.7,
-    setpoint_sensor1: 10.1,
-    flow_sensor2: 8.9,
-    setpoint_sensor2: 7.2,
+    sniffer: 11.7,
+    purway: 10.1,
   },
   {
     time: "Now",
-    flow_sensor1: 11.9,
-    setpoint_sensor1: 10.1,
-    flow_sensor2: 9.0,
-    setpoint_sensor2: 7.2,
+    sniffer: 11.9,
+    purway: 10.1,
   },
 ];
 
-const sensorTheme = {
-  sensor1: {
-    title: "Methane",
-    flowStroke: color.green,
-    flowFill: "rgba(106, 214, 194, 0.34)",
-    setpointStroke: color.orange,
-    setpointFill: "rgba(253, 148, 86, 0.28)",
+const seriesTheme = {
+  purway: {
+    label: "ln/min",
+    valueLabel: "Purway",
+    stroke: color.orange,
+    fill: "rgba(253, 148, 86, 0.26)",
   },
-  sensor2: {
-    title: "Sniffer",
-    flowStroke: "#59d5ff",
-    flowFill: "rgba(89, 213, 255, 0.30)",
-    setpointStroke: "#ffb16b",
-    setpointFill: "rgba(255, 177, 107, 0.24)",
+  sniffer: {
+    label: "ln/min",
+    valueLabel: "Sniffer",
+    stroke: color.green,
+    fill: "rgba(106, 214, 194, 0.30)",
   },
 };
 
-export function FlowChart({ sensor = "sensor1" }) {
+export function FlowChart() {
   const chartId = useId().replace(/:/g, "");
-  const flowKey = `flow_${sensor}`;
-  const setpointKey = `setpoint_${sensor}`;
-  const theme = sensorTheme[sensor] || sensorTheme.sensor1;
   const latestPoint = safeData[safeData.length - 1];
-  const latestFlow = latestPoint[flowKey];
-  const latestSetpoint = latestPoint[setpointKey];
   const peakValue = Math.max(
-    ...safeData.map((point) => point[flowKey]),
-    ...safeData.map((point) => point[setpointKey]),
+    ...safeData.map((point) => point.sniffer),
+    ...safeData.map((point) => point.purway),
   );
   const leftTicks = [
     0,
@@ -129,103 +101,79 @@ export function FlowChart({ sensor = "sensor1" }) {
 
   return (
     <div
-      className="flex h-full w-full flex-col rounded-xl border px-3 py-3"
-      style={{ backgroundColor: color.surface, borderColor: color.border }}
+      className="flex h-full w-full flex-col gap-3"
     >
-      <div className="mb-2 flex items-center justify-between gap-3">
+      <div className="flex items-start justify-between gap-3">
         <div>
-          <h3
-            className="text-sm font-bold uppercase tracking-[0.12em]"
-            style={{ color: color.textMuted }}
+          <p
+            className="text-xs uppercase tracking-[0.18em]"
+            style={{ color: color.green }}
           >
-            {theme.title}
+            methane flow
+          </p>
+          <h3
+            className="text-xl font-bold tracking-tight"
+            style={{ color: color.text }}
+          >
+            Combined sensor view
           </h3>
         </div>
-        <div className="flex flex-row">
-          <div className="text-right me-10">
-            <div
-              className="text-lg font-semibold leading-none"
-              style={{ color: color.orange }}
-            >
-              {latestFlow.toFixed(1)}
-            </div>
-            <div
-              className="text-[11px] uppercase tracking-[0.12em]"
-              style={{ color: color.textDim }}
-            >
-              Purway
-            </div>
-          </div>
-          <div className="text-right ms-10">
-            <div
-              className="text-lg font-semibold leading-none"
-              style={{ color: color.green }}
-            >
-              {latestFlow.toFixed(1)}
-            </div>
-            <div
-              className="text-[11px] uppercase tracking-[0.12em]"
-              style={{ color: color.textDim }}
-            >
-              Sniffer
-            </div>
-          </div>
+        <div
+          className="rounded-full px-3 py-1 text-xs font-medium"
+          style={{ backgroundColor: color.orangeSoft, color: color.orange }}
+        >
+          Live
         </div>
       </div>
 
-      <div className="min-h-[240px] flex-1">
+      <div className="grid gap-3 sm:grid-cols-2">
+        {Object.entries(seriesTheme).map(([sensorKey, theme]) => {
+          const latestValue = latestPoint[sensorKey];
+
+          return (
+            <div
+              key={sensorKey}
+              className="rounded-lg border px-3 py-2.5"
+              style={{ backgroundColor: color.surface, borderColor: color.border }}
+            >
+              <div className="text-[13px] uppercase tracking-[0.12em]" style={{ color: color.textMuted }}>
+                {theme.valueLabel}
+              </div>
+              <div className="flex flex-row mt-1 text-lg font-semibold leading-none" style={{ color: theme.stroke }}>
+                {latestValue.toFixed(1)}
+                <p className="ms-1 mt-1.5 text-[11px] uppercase tracking-[0.12em]" style={{ color: color.textMuted}}>
+                    {theme.label}
+                </p>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      <div
+        className="min-h-[400px] rounded-xl border p-3"
+      style={{ backgroundColor: color.surface, borderColor: color.border }}
+    >
         <ResponsiveContainer width="100%" height="100%">
           <AreaChart
             data={safeData}
-            margin={{ top: 8, right: 6, left: -24, bottom: 0 }}
+            margin={{ top: 8, right: 6, left: 8, bottom: 0 }}
           >
             <defs>
-              <linearGradient
-                id={`flowGradient-${chartId}`}
-                x1="0"
-                y1="0"
-                x2="0"
-                y2="1"
-              >
-                <stop
-                  offset="0%"
-                  stopColor={theme.flowFill}
-                  stopOpacity={0.95}
-                />
-                <stop
-                  offset="72%"
-                  stopColor={theme.flowFill}
-                  stopOpacity={0.34}
-                />
-                <stop
-                  offset="100%"
-                  stopColor={theme.flowFill}
-                  stopOpacity={0}
-                />
-              </linearGradient>
-              <linearGradient
-                id={`setpointGradient-${chartId}`}
-                x1="0"
-                y1="0"
-                x2="0"
-                y2="1"
-              >
-                <stop
-                  offset="0%"
-                  stopColor={theme.setpointFill}
-                  stopOpacity={0.9}
-                />
-                <stop
-                  offset="72%"
-                  stopColor={theme.setpointFill}
-                  stopOpacity={0.28}
-                />
-                <stop
-                  offset="100%"
-                  stopColor={theme.setpointFill}
-                  stopOpacity={0}
-                />
-              </linearGradient>
+              {Object.entries(seriesTheme).map(([sensorKey, theme]) => (
+                <linearGradient
+                  key={sensorKey}
+                  id={`flowGradient-${chartId}-${sensorKey}`}
+                  x1="0"
+                  y1="0"
+                  x2="0"
+                  y2="1"
+                >
+                  <stop offset="0%" stopColor={theme.fill} stopOpacity={0.95} />
+                  <stop offset="70%" stopColor={theme.fill} stopOpacity={0.34} />
+                  <stop offset="100%" stopColor={theme.fill} stopOpacity={0} />
+                </linearGradient>
+              ))}
             </defs>
             <CartesianGrid
               strokeDasharray="4 4"
@@ -241,24 +189,21 @@ export function FlowChart({ sensor = "sensor1" }) {
               interval="preserveStartEnd"
             />
             <YAxis
-              yAxisId="left"
               stroke={color.textDim}
               tickLine={false}
-              axisLine={false}
-              width={28}
+              axisLine={{ stroke: color.borderStrong }}
+              width={44}
               style={{ fontSize: "11px" }}
               ticks={leftTicks}
-            />
-            <YAxis
-              yAxisId="right"
-              orientation="right"
-              stroke={color.textDim}
-              tickLine={false}
-              axisLine={false}
-              width={34}
-              style={{ fontSize: "11px" }}
-              ticks={leftTicks.map((tick) => Number((tick * 70).toFixed(0)))}
-              tickFormatter={(value) => `${value}`}
+              tick={{ fill: color.text, fontSize: 11 }}
+              label={{
+                value: "ln/min",
+                angle: -90,
+                position: "insideLeft",
+                offset: 0,
+                fill: color.text,
+                fontSize: 11,
+              }}
             />
             <Tooltip
               contentStyle={{
@@ -274,60 +219,34 @@ export function FlowChart({ sensor = "sensor1" }) {
               }
               labelStyle={{ color: color.text }}
             />
-            <Area
-              yAxisId="left"
-              type="monotone"
-              dataKey={setpointKey}
-              stroke={theme.setpointStroke}
-              strokeWidth={2}
-              fill={`url(#setpointGradient-${chartId})`}
-              isAnimationActive={false}
-              dot={false}
-              activeDot={{ r: 4, strokeWidth: 0, fill: theme.setpointStroke }}
-            />
-            <Area
-              yAxisId="left"
-              type="monotone"
-              dataKey={flowKey}
-              stroke={theme.flowStroke}
-              strokeWidth={2.5}
-              fill={`url(#flowGradient-${chartId})`}
-              isAnimationActive={false}
-              dot={false}
-              activeDot={{ r: 4, strokeWidth: 0, fill: theme.flowStroke }}
-            />
-            <Line
-              yAxisId="left"
-              type="monotone"
-              dataKey={setpointKey}
-              stroke={theme.setpointStroke}
-              strokeWidth={2}
-              dot={false}
-              isAnimationActive={false}
-            />
-            <Line
-              yAxisId="left"
-              type="monotone"
-              dataKey={flowKey}
-              stroke={theme.flowStroke}
-              strokeWidth={2.5}
-              dot={false}
-              isAnimationActive={false}
-            />
+            {Object.entries(seriesTheme).map(([sensorKey, theme]) => {
+              const dataKey = sensorKey;
+
+              return (
+                <React.Fragment key={sensorKey}>
+                  <Area
+                    type="monotone"
+                    dataKey={dataKey}
+                    stroke={theme.stroke}
+                    strokeWidth={2.3}
+                    fill={`url(#flowGradient-${chartId}-${sensorKey})`}
+                    isAnimationActive={false}
+                    dot={false}
+                    activeDot={{ r: 4, strokeWidth: 0, fill: theme.stroke }}
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey={dataKey}
+                    stroke={theme.stroke}
+                    strokeWidth={2.3}
+                    dot={false}
+                    isAnimationActive={false}
+                  />
+                </React.Fragment>
+              );
+            })}
           </AreaChart>
         </ResponsiveContainer>
-
-        <div
-          className="mt-2 flex items-center justify-between text-[11px] uppercase tracking-[0.12em]"
-          style={{ color: color.textDim }}
-        >
-          <span style={{ color: theme.setpointStroke }}>
-            Setpoint {latestSetpoint.toFixed(1)}
-          </span>
-          <span style={{ color: theme.flowStroke }}>
-            Flow {latestFlow.toFixed(1)}
-          </span>
-        </div>
       </div>
     </div>
   );

@@ -27,7 +27,7 @@ export function DeviceTabs({
         borderColor: color.border,
       }}
     >
-      <div className="flex h-24 w-full items-center px-6">
+      <div className="flex h-15 w-full items-center px-6">
         <div className="flex min-w-0 flex-1 gap-4 overflow-x-auto no-scrollbar">
           {devices.map((device, index) => {
             const isActive = activeDeviceId
@@ -69,7 +69,7 @@ export function DeviceTabs({
             )
           })}
         </div>
-        <div className="ml-4 flex shrink-0 justify-end rounded-lg px-4 py-3" style={{ backgroundColor: color.surface }}>
+        <div className="ml-4 flex shrink-0 justify-end rounded-lg px-4 py-2" style={{ backgroundColor: color.surface }}>
           <img src="/src/assets/EERL_logo_black.svg" alt="EERL Logo" className=" w-25 h-auto" />
         </div>
       </div>

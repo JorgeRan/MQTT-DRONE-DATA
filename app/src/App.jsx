@@ -12,19 +12,19 @@ let devices = [
   {
     id: "device1",
     name: "M350",
-    type: "Quadcopter",
+    type: "Drone",
     status: "online",
   },
   {
     id: "device2",
     name: "M400-1",
-    type: "Hexacopter",
+    type: "Drone",
     status: "offline",
   },
   {
     id: "device3",
     name: "M400-2",
-    type: "Octocopter",
+    type: "Drone",
     status: "warning",
   },
 ];
@@ -45,7 +45,7 @@ function App() {
               <Map />
               <Position />
             </div>
-            <div className="grid w-full gap-3 xl:grid-cols-[1.8fr_0.6fr]">
+            <div className="grid w-full gap-3 xl:grid-cols-[1.4fr_0.8fr]">
               <MethanePanel />
               <WindPanel/>
             </div>
