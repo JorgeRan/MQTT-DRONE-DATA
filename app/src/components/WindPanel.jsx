@@ -110,10 +110,10 @@ export function WindPanel() {
         </div> */}
 
         <div
-          className="flex min-h-[300px] w-full items-center justify-center rounded-xl border p-2"
+          className="flex min-h-[300px] h-full w-full items-center justify-center rounded-xl border m-0 p-0"
           style={{ backgroundColor: color.surface, borderColor: color.border }}
         >
-          <div className="w-full max-w-[360px] [&_svg_text]:fill-white [&_svg_text]:opacity-100">
+          <div className="w-full h-full max-w-[360px] [&_svg_text]:fill-white [&_svg_text]:opacity-100 m-0 p-0">
             <Chart
               chartData={chartData}
               columns={windColumns}

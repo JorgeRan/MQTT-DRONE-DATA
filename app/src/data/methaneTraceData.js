@@ -197,3 +197,15 @@ export function sliceTraceDataset(traceDataset, startIndex, endIndex) {
         features: traceDataset.features.slice(safeStart, safeEnd + 1),
     }
 }
+
+export function filterTraceDatasetBySelection(traceDataset, selection) {
+    const slicedDataset = sliceTraceDataset(traceDataset, selection.startIndex, selection.endIndex)
+
+    return {
+        type: 'FeatureCollection',
+        features: slicedDataset.features.filter((feature) => {
+            const methane = feature.properties?.methane ?? 0
+            return methane >= selection.ppmMin && methane <= selection.ppmMax
+        }),
+    }
+}

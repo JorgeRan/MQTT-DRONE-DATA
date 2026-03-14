@@ -14,22 +14,47 @@ import { color } from "../constants/tailwind";
 
 const seriesTheme = {
   purway: {
-    label: "ln/min",
+    label: "ppm",
     valueLabel: "Purway",
     stroke: color.orange,
     fill: "rgba(253, 148, 86, 0.26)",
   },
   sniffer: {
-    label: "ln/min",
+    label: "ppm",
     valueLabel: "Sniffer",
     stroke: color.green,
     fill: "rgba(106, 214, 194, 0.30)",
   },
 };
 
-function clampWindow(selection, dataLength) {
+const chartFrame = {
+  top: 72,
+  bottom: 34,
+  left: 52,
+  right: 12,
+};
+
+function formatDuration(durationMs) {
+  const totalSeconds = Math.max(0, Math.floor(durationMs / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  return [hours, minutes, seconds]
+    .map((value) => String(value).padStart(2, "0"))
+    .join(":");
+}
+
+function clampSelection(selection, dataLength, maxPpm) {
+  const minimumPpmBand = Math.min(Math.max(maxPpm * 0.02, 0.1), maxPpm);
+
   if (dataLength <= 1) {
-    return { startIndex: 0, endIndex: 0 };
+    return {
+      startIndex: 0,
+      endIndex: 0,
+      ppmMin: 0,
+      ppmMax: maxPpm,
+    };
   }
 
   const safeStart = Math.max(0, Math.min(selection.startIndex, dataLength - 2));
@@ -38,59 +63,97 @@ function clampWindow(selection, dataLength) {
     Math.min(selection.endIndex, dataLength - 1),
   );
 
+  if (maxPpm <= minimumPpmBand) {
+    return {
+      startIndex: safeStart,
+      endIndex: safeEnd,
+      ppmMin: 0,
+      ppmMax: maxPpm,
+    };
+  }
+
+  const safePpmMin = Math.max(
+    0,
+    Math.min(selection.ppmMin ?? 0, maxPpm - minimumPpmBand),
+  );
+  const safePpmMax = Math.max(
+    safePpmMin + minimumPpmBand,
+    Math.min(selection.ppmMax ?? maxPpm, maxPpm),
+  );
+
   return {
     startIndex: safeStart,
     endIndex: safeEnd,
+    ppmMin: safePpmMin,
+    ppmMax: safePpmMax,
   };
 }
 
 export function FlowChart({ flowData, selection, onSelectionChange }) {
   const chartId = useId().replace(/:/g, "");
   const navigatorRef = useRef(null);
+  const ppmRangeRef = useRef(null);
   const dragHandleRef = useRef(null);
   const dataLength = flowData.length;
   const maxIndex = Math.max(dataLength - 1, 0);
-  const safeSelection = useMemo(
-    () => clampWindow(selection, dataLength),
-    [selection, dataLength],
-  );
-  const filteredData = useMemo(
-    () => flowData.slice(safeSelection.startIndex, safeSelection.endIndex + 1),
-    [flowData, safeSelection],
-  );
-  const latestPoint =
-    filteredData[filteredData.length - 1] ?? flowData[dataLength - 1];
-  const peakValue = Math.max(
-    1,
-    ...filteredData.map((point) => point.sniffer),
-    ...filteredData.map((point) => point.purway),
-  );
   const fullPeakValue = Math.max(
     1,
     ...flowData.map((point) => point.sniffer),
     ...flowData.map((point) => point.purway),
+    ...flowData.map((point) => point.methane),
   );
-  const leftTicks = [
-    0,
-    Math.ceil(peakValue * 0.35),
-    Math.ceil(peakValue * 0.7),
-    Math.ceil(peakValue),
-  ];
+  const safeSelection = useMemo(
+    () => clampSelection(selection, dataLength, fullPeakValue),
+    [selection, dataLength, fullPeakValue],
+  );
+  const windowedData = useMemo(
+    () => flowData.slice(safeSelection.startIndex, safeSelection.endIndex + 1),
+    [flowData, safeSelection],
+  );
+  const filteredData = useMemo(
+    () =>
+      windowedData.filter(
+        (point) =>
+          point.methane >= safeSelection.ppmMin &&
+          point.methane <= safeSelection.ppmMax,
+      ),
+    [windowedData, safeSelection],
+  );
+  const latestPoint =
+    filteredData[filteredData.length - 1] ??
+    windowedData[windowedData.length - 1] ??
+    flowData[dataLength - 1];
   const fullTicks = [
     0,
     Math.ceil(fullPeakValue * 0.35),
     Math.ceil(fullPeakValue * 0.7),
     Math.ceil(fullPeakValue),
   ];
-  const startPercent = maxIndex > 0 ? (safeSelection.startIndex / maxIndex) * 100 : 0;
+  const startPercent =
+    maxIndex > 0 ? (safeSelection.startIndex / maxIndex) * 100 : 0;
   const endPercent =
     maxIndex > 0 ? (safeSelection.endIndex / maxIndex) * 100 : 100;
-  const windowStart = filteredData[0];
-  const windowEnd = filteredData[filteredData.length - 1];
+  const ppmMinPercent =
+    fullPeakValue > 0
+      ? 100 - (safeSelection.ppmMin / fullPeakValue) * 100
+      : 100;
+  const ppmMaxPercent =
+    fullPeakValue > 0 ? 100 - (safeSelection.ppmMax / fullPeakValue) * 100 : 0;
+  const windowStart = windowedData[0];
+  const windowEnd = windowedData[windowedData.length - 1];
+  const selectedSampleCount = filteredData.length;
+  const deltaTime = formatDuration(
+    (windowEnd?.timestampMs ?? 0) - (windowStart?.timestampMs ?? 0),
+  );
 
   useEffect(() => {
-    const updateSelectionFromClientX = (clientX) => {
-      if (!navigatorRef.current || !dragHandleRef.current || maxIndex <= 0) {
+    const minimumPpmBand = Math.min(
+      Math.max(fullPeakValue * 0.02, 0.1),
+      fullPeakValue,
+    );
+
+    const updateTimeSelectionFromClientX = (clientX) => {
+      if (!navigatorRef.current || maxIndex <= 0) {
         return;
       }
 
@@ -101,22 +164,57 @@ export function FlowChart({ flowData, selection, onSelectionChange }) {
       );
       const nextIndex = Math.round(clampedRatio * maxIndex);
 
-      if (dragHandleRef.current === "start") {
+      if (dragHandleRef.current?.handle === "start") {
         onSelectionChange({
+          ...safeSelection,
           startIndex: Math.min(nextIndex, safeSelection.endIndex - 1),
-          endIndex: safeSelection.endIndex,
         });
         return;
       }
 
       onSelectionChange({
-        startIndex: safeSelection.startIndex,
+        ...safeSelection,
         endIndex: Math.max(nextIndex, safeSelection.startIndex + 1),
       });
     };
 
+    const updatePpmSelectionFromClientY = (clientY) => {
+      if (!ppmRangeRef.current || fullPeakValue <= 0) {
+        return;
+      }
+
+      const bounds = ppmRangeRef.current.getBoundingClientRect();
+      const clampedRatio = Math.max(
+        0,
+        Math.min(1 - (clientY - bounds.top) / bounds.height, 1),
+      );
+      const nextPpm = Number((clampedRatio * fullPeakValue).toFixed(2));
+
+      if (dragHandleRef.current?.handle === "ppmMin") {
+        onSelectionChange({
+          ...safeSelection,
+          ppmMin: Math.min(nextPpm, safeSelection.ppmMax - minimumPpmBand),
+        });
+        return;
+      }
+
+      onSelectionChange({
+        ...safeSelection,
+        ppmMax: Math.max(nextPpm, safeSelection.ppmMin + minimumPpmBand),
+      });
+    };
+
     const handlePointerMove = (event) => {
-      updateSelectionFromClientX(event.clientX);
+      if (!dragHandleRef.current) {
+        return;
+      }
+
+      if (dragHandleRef.current.axis === "x") {
+        updateTimeSelectionFromClientX(event.clientX);
+        return;
+      }
+
+      updatePpmSelectionFromClientY(event.clientY);
     };
 
     const handlePointerUp = () => {
@@ -131,18 +229,21 @@ export function FlowChart({ flowData, selection, onSelectionChange }) {
       window.removeEventListener("pointerup", handlePointerUp);
     };
   }, [
+    fullPeakValue,
     maxIndex,
     onSelectionChange,
     safeSelection.endIndex,
+    safeSelection.ppmMax,
+    safeSelection.ppmMin,
     safeSelection.startIndex,
   ]);
 
-  const beginHandleDrag = (handle) => (event) => {
+  const beginHandleDrag = (axis, handle) => (event) => {
     event.preventDefault();
-    dragHandleRef.current = handle;
+    dragHandleRef.current = { axis, handle };
     event.currentTarget.setPointerCapture?.(event.pointerId);
 
-    if (navigatorRef.current && maxIndex > 0) {
+    if (axis === "x" && navigatorRef.current && maxIndex > 0) {
       const bounds = navigatorRef.current.getBoundingClientRect();
       const clampedRatio = Math.max(
         0,
@@ -152,13 +253,40 @@ export function FlowChart({ flowData, selection, onSelectionChange }) {
 
       if (handle === "start") {
         onSelectionChange({
+          ...safeSelection,
           startIndex: Math.min(nextIndex, safeSelection.endIndex - 1),
-          endIndex: safeSelection.endIndex,
         });
       } else {
         onSelectionChange({
-          startIndex: safeSelection.startIndex,
+          ...safeSelection,
           endIndex: Math.max(nextIndex, safeSelection.startIndex + 1),
+        });
+      }
+
+      return;
+    }
+
+    if (axis === "y" && ppmRangeRef.current && fullPeakValue > 0) {
+      const minimumPpmBand = Math.min(
+        Math.max(fullPeakValue * 0.02, 0.1),
+        fullPeakValue,
+      );
+      const bounds = ppmRangeRef.current.getBoundingClientRect();
+      const clampedRatio = Math.max(
+        0,
+        Math.min(1 - (event.clientY - bounds.top) / bounds.height, 1),
+      );
+      const nextPpm = Number((clampedRatio * fullPeakValue).toFixed(2));
+
+      if (handle === "ppmMin") {
+        onSelectionChange({
+          ...safeSelection,
+          ppmMin: Math.min(nextPpm, safeSelection.ppmMax - minimumPpmBand),
+        });
+      } else {
+        onSelectionChange({
+          ...safeSelection,
+          ppmMax: Math.max(nextPpm, safeSelection.ppmMin + minimumPpmBand),
         });
       }
     }
@@ -241,50 +369,25 @@ export function FlowChart({ flowData, selection, onSelectionChange }) {
         }}
       >
         <div className="mb-3 flex items-center justify-between gap-3">
-          <div>
-            <p
-              className="text-xs uppercase tracking-[0.18em]"
-              style={{ color: color.text }}
-            >
-              Time window selector
-            </p>
-            <p
-              className="text-[11px] uppercase tracking-[0.12em]"
-              style={{ color: color.textMuted }}
-            >
-              Drag the two vertical columns to filter the chart and both maps.
-            </p>
-          </div>
           <div
-            className="text-right text-[11px] uppercase tracking-[0.12em]"
+            className="flex flex-row-1 justify-evenly text-right w-full text-[11px] uppercase tracking-[0.12em]"
             style={{ color: color.textMuted }}
           >
-            <div className="flex flex-row-1 gap-2">
-              <div
-                id="rectangle"
-                style={{
-                  width: "10px",
-                  height: "3px",
-                  backgroundColor: color.orange,
-                  borderColor: color.orange,
-                  margin: "7px 0 0 0",
-                }}
-              ></div>
-              {windowStart?.timestampIso ?? "--"}
+            <div>
+              <div>T1 = {formatDuration(windowStart?.timestampMs ?? "--").slice(4)}</div>
+              <div>T2 = {formatDuration(windowEnd?.timestampMs ?? "--").slice(4)}</div>
             </div>
-            <div className="flex flex-row-1 gap-2">
-              <div
-                id="rectangle"
-                style={{
-                  width: "10px",
-                  height: "3px",
-                  backgroundColor: color.green,
-                  borderColor: color.green,
-                  margin: "7px 0 0 0",
-                }}
-              ></div>
-              {windowEnd?.timestampIso ?? "--"}
+            <div className="flex items-center">
+              ΔT = {deltaTime}
             </div>
+            <div>
+              <div>PPM1 = {safeSelection.ppmMin.toFixed(2)}</div>
+              <div>PPM2 = {safeSelection.ppmMax.toFixed(2)}</div>
+            </div>
+            <div className="flex items-center">
+                ΔPPM = {(safeSelection.ppmMax - safeSelection.ppmMin).toFixed(2)}
+            </div>
+
           </div>
         </div>
 
@@ -344,7 +447,7 @@ export function FlowChart({ flowData, selection, onSelectionChange }) {
                 ticks={fullTicks}
                 tick={{ fill: color.text, fontSize: 11 }}
                 label={{
-                  value: "ln/min",
+                  value: "ppm",
                   angle: -90,
                   position: "insideLeft",
                   offset: 0,
@@ -386,6 +489,22 @@ export function FlowChart({ flowData, selection, onSelectionChange }) {
                   ifOverflow="extendDomain"
                 />
               ) : null}
+              {safeSelection.ppmMin > 0 ? (
+                <ReferenceArea
+                  y1={0}
+                  y2={safeSelection.ppmMin}
+                  fill="rgba(3, 7, 18, 0.44)"
+                  ifOverflow="extendDomain"
+                />
+              ) : null}
+              {safeSelection.ppmMax < fullPeakValue ? (
+                <ReferenceArea
+                  y1={safeSelection.ppmMax}
+                  y2={fullPeakValue}
+                  fill="rgba(3, 7, 18, 0.44)"
+                  ifOverflow="extendDomain"
+                />
+              ) : null}
               {Object.entries(seriesTheme).map(([sensorKey, theme]) => {
                 const dataKey = sensorKey;
 
@@ -420,31 +539,107 @@ export function FlowChart({ flowData, selection, onSelectionChange }) {
         <div
           className="pointer-events-none absolute top-[72px] bottom-[34px]"
           style={{
-            left: `${startPercent }%`,
+            left: `${startPercent}%`,
             width: `${Math.max(endPercent - startPercent, 0)}%`,
             backgroundColor: "rgba(255, 255, 255, 0.04)",
-           // boxShadow: "inset 0 0 0 1px rgba(255,255,255,0.08)",
           }}
         />
+
+        <div
+          ref={ppmRangeRef}
+          className="absolute"
+          style={{
+            top: `${chartFrame.top}px`,
+            right: `${chartFrame.right}px`,
+            bottom: `${chartFrame.bottom}px`,
+            left: `${chartFrame.left}px`,
+            pointerEvents: "none",
+          }}
+        >
+          <div
+            className="absolute left-0 right-0"
+            style={{
+              top: `${ppmMaxPercent}%`,
+              height: `${Math.max(ppmMinPercent - ppmMaxPercent, 0)}%`,
+              backgroundColor: "rgba(255, 255, 255, 0.04)",
+            }}
+          />
+
+          <button
+            type="button"
+            aria-label="Adjust minimum ppm selection"
+            className="absolute left-0 right-0 h-8 -translate-y-1/2 cursor-ns-resize bg-transparent"
+            style={{ top: `${ppmMinPercent}%`, pointerEvents: "auto" }}
+            onPointerDown={beginHandleDrag("y", "ppmMin")}
+          >
+            <span
+              className="absolute inset-x-0 top-1/2 h-[2px] -translate-y-1/2"
+              style={{
+                backgroundColor: color.text,
+                boxShadow: `0 0 0 1px ${color.orangeSoft}, 0 0 10px rgba(253, 148, 86, 0.25)`,
+              }}
+            />
+            <span
+              className="absolute right-0 top-1/2 -translate-y-1/2 rounded-md px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.14em]"
+              style={{
+                backgroundColor: color.card,
+                color: color.text,
+                border: `1px solid ${color.text}`,
+              }}
+            >
+              PPM1 {safeSelection.ppmMin.toFixed(2)}
+            </span>
+          </button>
+
+          <button
+            type="button"
+            aria-label="Adjust maximum ppm selection"
+            className="absolute left-0 right-0 h-8 -translate-y-1/2 cursor-ns-resize bg-transparent"
+            style={{ top: `${ppmMaxPercent}%`, pointerEvents: "auto" }}
+            onPointerDown={beginHandleDrag("y", "ppmMax")}
+          >
+            <span
+              className="absolute inset-x-0 top-1/2 h-[2px] -translate-y-1/2"
+              style={{
+                backgroundColor: color.text,
+                boxShadow: `0 0 0 1px ${color.greenSoft}, 0 0 10px rgba(106, 214, 194, 0.22)`,
+              }}
+            />
+            <span
+              className="absolute right-0 top-1/2 -translate-y-1/2 rounded-md px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.14em]"
+              style={{
+                backgroundColor: color.card,
+                color: color.text,
+                border: `1px solid ${color.text}`,
+              }}
+            >
+              PPM2 {safeSelection.ppmMax.toFixed(2)}
+            </span>
+          </button>
+        </div>
 
         <button
           type="button"
           aria-label="Adjust selection start"
           className="absolute top-[72px] bottom-[20px] w-8 -translate-x-1/2 cursor-ew-resize bg-transparent"
           style={{ left: `${startPercent}%` }}
-          onPointerDown={beginHandleDrag("start")}
+          onPointerDown={beginHandleDrag("x", "start")}
         >
           <span
             className="absolute left-1/2 top-0 h-full -translate-x-1/2"
             style={{
               width: "2px",
-              backgroundColor: color.orange,
+              backgroundColor: color.text,
               boxShadow: `0 0 0 1px ${color.orangeSoft}, 0 0 10px rgba(253, 148, 86, 0.25)`,
             }}
           />
           <span
             className="absolute bottom-0 left-1/2 -translate-x-1/2 rounded-md px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.14em]"
-            style={{ backgroundColor: color.card, color: color.orange, border: `1px solid ${color.orange}` }}
+            style={{
+              backgroundColor: color.card,
+              color: color.text,
+              border: `1px solid ${color.text}`,
+            }}
           >
             T1
           </span>
@@ -455,19 +650,23 @@ export function FlowChart({ flowData, selection, onSelectionChange }) {
           aria-label="Adjust selection end"
           className="absolute top-[72px] bottom-[20px] w-8 -translate-x-1/2 cursor-ew-resize bg-transparent"
           style={{ left: `${endPercent}%` }}
-          onPointerDown={beginHandleDrag("end")}
+          onPointerDown={beginHandleDrag("x", "end")}
         >
           <span
             className="absolute left-1/2 top-0 h-full -translate-x-1/2"
             style={{
               width: "2px",
-              backgroundColor: color.green,
+              backgroundColor: color.text,
               boxShadow: `0 0 0 1px ${color.greenSoft}, 0 0 10px rgba(106, 214, 194, 0.22)`,
             }}
           />
           <span
             className="absolute bottom-0 left-1/2 -translate-x-1/2 rounded-md px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.14em]"
-            style={{ backgroundColor: color.card, color: color.green, border: `1px solid ${color.green}` }}
+            style={{
+              backgroundColor: color.card,
+              color: color.text,
+              border: `1px solid ${color.text}`,
+            }}
           >
             T2
           </span>

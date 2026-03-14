@@ -61,6 +61,39 @@ export function Position({ traceDataset }) {
         'horizon-blend': 0.08,
       })
 
+      const labelLayerId = map
+        .getStyle()
+        ?.layers?.find((layer) => layer.type === 'symbol' && layer.layout?.['text-field'])?.id
+
+      map.addLayer(
+        {
+          id: 'mapbox-3d-buildings',
+          source: 'composite',
+          'source-layer': 'building',
+          filter: ['==', ['get', 'extrude'], 'true'],
+          type: 'fill-extrusion',
+          minzoom: 15,
+          paint: {
+            'fill-extrusion-color': [
+              'interpolate',
+              ['linear'],
+              ['get', 'height'],
+              0,
+              'rgba(148, 163, 184, 0.65)',
+              40,
+              'rgba(203, 213, 225, 0.78)',
+              120,
+              'rgba(255, 255, 255, 0.9)',
+            ],
+            'fill-extrusion-base': ['coalesce', ['get', 'min_height'], 0],
+            'fill-extrusion-height': ['coalesce', ['get', 'height'], 0],
+            'fill-extrusion-opacity': 0.72,
+            'fill-extrusion-vertical-gradient': true,
+          },
+        },
+        labelLayerId,
+      )
+
       map.addSource('methane-plume', {
         type: 'geojson',
         data: methanePlumeDataset,

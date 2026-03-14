@@ -5,7 +5,11 @@ import { MethanePanel } from "./components/MethanePanel";
 import { Map } from "./components/Map";
 import { WindPanel } from "./components/WindPanel";
 import { Position } from "./components/3DPosition";
-import { flowChartData, methaneTraceDataset, sliceTraceDataset } from "./data/methaneTraceData";
+import {
+  filterTraceDatasetBySelection,
+  flowChartData,
+  methaneTraceDataset,
+} from "./data/methaneTraceData";
 
 let devices = [
   {
@@ -28,14 +32,21 @@ let devices = [
   },
 ];
 
+const maxSelectablePpm = Math.max(
+  1,
+  ...flowChartData.map((point) => Math.max(point.sniffer, point.purway, point.methane)),
+);
+
 function App() {
   const [selectedWindow, setSelectedWindow] = useState({
     startIndex: 0,
     endIndex: flowChartData.length - 1,
+    ppmMin: 0,
+    ppmMax: maxSelectablePpm,
   });
 
   const filteredTraceDataset = useMemo(
-    () => sliceTraceDataset(methaneTraceDataset, selectedWindow.startIndex, selectedWindow.endIndex),
+    () => filterTraceDatasetBySelection(methaneTraceDataset, selectedWindow),
     [selectedWindow],
   );
 

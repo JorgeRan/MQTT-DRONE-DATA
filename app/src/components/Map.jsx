@@ -245,7 +245,7 @@ export function Map({ traceDataset }) {
                     <span>alt: {altitude} m</span>
                 </div>
 
-                <div className='grid gap-3 md:grid-cols-[1.2fr_1fr]'>
+                {/* <div className='grid gap-3 md:grid-cols-[1.2fr_1fr]'>
                     <div className='rounded-lg border px-3 py-2.5' style={{ backgroundColor: color.surface, borderColor: color.border }}>
                         <div className='text-[11px] uppercase tracking-[0.12em]' style={{ color: color.text }}>
                             Methane trace points
@@ -269,14 +269,19 @@ export function Map({ traceDataset }) {
                             ))}
                         </div>
                     </div>
-                </div>
+                </div> */}
 
                 {mapboxToken ? (
+                    <div className='flex flex-col-2'>
                     <div
                         ref={mapContainerRef}
-                        className='min-h-[360px] w-full rounded-lg border'
+                        className='min-h-[460px] w-full rounded-lg border'
                         style={{ borderColor: color.border }}
                     />
+                    <div className='w-10 h-full' >
+
+                    </div>
+                    </div>
                 ) : (
                     <div
                         className='flex min-h-[360px] w-full items-center justify-center rounded-lg border px-6 text-center'
