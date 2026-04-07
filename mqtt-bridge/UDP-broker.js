@@ -1,19 +1,19 @@
-import { createSocket } from "node:dgram";
+import { createSocket } from 'dgram';
 
-const server = createSocket("udp4");
 
-server.on("error", (err) => {
-  console.error(`server error: \n${err.stack}`);
-  server.close();
+
+const receiver = createSocket('udp4');
+const PORT = 5000;
+
+receiver.bind(PORT, () => {
+  console.log(`UDP Receiver bound to port ${PORT}`);
 });
 
-server.on('message', (msg, rinfo) => {
-    console.log(`server got: ${msg} from ${rinfo.address}:${rinfo.port}`);
+receiver.on('message', (msg, rinfo) => {
+  console.log(`Received: ${msg} from ${rinfo.address}:${rinfo.port}`);
 });
 
-server.on('listening', () => {
-    const address = server.address();
-    console.log(`server listening ${address.address}:${address.port}`);
+receiver.on('error', (err) => {
+  console.error(`Receiver error:\n${err.stack}`);
+  receiver.close();
 });
-
-server.bind(5000);

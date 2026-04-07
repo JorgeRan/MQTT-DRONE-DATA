@@ -2,10 +2,18 @@ import mqtt from 'mqtt';
 import express from 'express';
 import dotenv from 'dotenv';
 import { createServer } from 'http';
+import { createSocket } from 'node:dgram';
+import dns from 'node:dns/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import sql from './db.js';
 import { createRemoteTelemetryStore } from './remoteTelemetryStore.js';
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+dotenv.config({ path: path.join(__dirname, '.env') });
 dotenv.config();
 
 const brokerUrl = process.env.MQTT_BROKER_URL || 'mqtts://1ff7f31f358d46628258e87380e60321.s1.eu.hivemq.cloud:8883';
@@ -17,6 +25,13 @@ const mqttTopics = (process.env.MQTT_TOPICS || 'M350/data,M400-1/data,M400-2/dat
     .filter(Boolean);
 const TELEMETRY_TABLE = 'telemetry_events';
 const LATEST_STATE_TABLE = 'drone_latest_state_cache';
+const MISSIONS_TABLE = 'missions';
+const INTERNET_CHECK_HOST = process.env.INTERNET_CHECK_HOST || 'one.one.one.one';
+const INTERNET_CHECK_INTERVAL_MS = Math.max(2000, Number(process.env.INTERNET_CHECK_INTERVAL_MS || 5000));
+const REMOTE_SYNC_BATCH_SIZE = Math.max(1, Number(process.env.REMOTE_SYNC_BATCH_SIZE || 200));
+const UDP_PORT = Math.max(1, Number(process.env.UDP_PORT || 5000));
+const UDP_HOST = process.env.UDP_HOST || '0.0.0.0';
+const UDP_TOPIC_FALLBACK = process.env.UDP_TOPIC_FALLBACK || 'udp/data';
 const remoteTelemetryStore = createRemoteTelemetryStore({
     telemetryTable: TELEMETRY_TABLE,
     latestStateTable: LATEST_STATE_TABLE,
@@ -25,7 +40,83 @@ const remoteTelemetryStore = createRemoteTelemetryStore({
 const PORT = Number(process.env.PORT || 3000);
 const app = express();
 const server = createServer(app);
+const udpServer = createSocket('udp4');
 const wss = new WebSocketServer({ server, path: '/ws/telemetry' });
+let hasInternet = false;
+let internetCheckTimer = null;
+let syncInProgress = false;
+const measurementState = {
+    status: 'idle',
+    startedAt: null,
+    accumulatedMs: 0,
+    excludedDroneIds: new Set(),
+};
+
+const toExcludedDroneIdSet = (value) => {
+    if (!Array.isArray(value)) {
+        return new Set();
+    }
+
+    return new Set(
+        value
+            .map((droneId) => (typeof droneId === 'string' ? droneId.trim() : ''))
+            .filter(Boolean),
+    );
+};
+
+const measurementElapsedMs = () => {
+    if (measurementState.status !== 'running' || !measurementState.startedAt) {
+        return measurementState.accumulatedMs;
+    }
+
+    return measurementState.accumulatedMs + Math.max(0, Date.now() - measurementState.startedAt);
+};
+
+const measurementStatusPayload = () => ({
+    status: measurementState.status,
+    elapsedSeconds: Math.floor(measurementElapsedMs() / 1000),
+});
+
+const startMeasurement = ({ excludedDroneIds } = {}) => {
+    measurementState.status = 'running';
+    measurementState.startedAt = Date.now();
+    measurementState.accumulatedMs = 0;
+    measurementState.excludedDroneIds = toExcludedDroneIdSet(excludedDroneIds);
+    return measurementStatusPayload();
+};
+
+const pauseMeasurement = () => {
+    if (measurementState.status === 'running' && measurementState.startedAt) {
+        measurementState.accumulatedMs += Math.max(0, Date.now() - measurementState.startedAt);
+    }
+
+    measurementState.status = 'paused';
+    measurementState.startedAt = null;
+    return measurementStatusPayload();
+};
+
+const resumeMeasurement = () => {
+    if (measurementState.status !== 'paused') {
+        return measurementStatusPayload();
+    }
+
+    measurementState.status = 'running';
+    measurementState.startedAt = Date.now();
+    return measurementStatusPayload();
+};
+
+const stopMeasurement = () => {
+    measurementState.status = 'idle';
+    measurementState.startedAt = null;
+    measurementState.accumulatedMs = 0;
+    measurementState.excludedDroneIds = new Set();
+    return measurementStatusPayload();
+};
+
+const updateMeasurementConfig = ({ excludedDroneIds } = {}) => {
+    measurementState.excludedDroneIds = toExcludedDroneIdSet(excludedDroneIds);
+    return measurementStatusPayload();
+};
 
 app.use((req, res, next) => {
     res.header("Access-Control-Allow-Origin", "*");
@@ -40,7 +131,7 @@ app.use((req, res, next) => {
     next();
 });
 
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 const initializeDatabase = async () => {
     await sql.unsafe(`
@@ -95,6 +186,18 @@ const initializeDatabase = async () => {
 
     await sql.unsafe(`CREATE INDEX IF NOT EXISTS idx_telemetry_events_drone_ts ON ${TELEMETRY_TABLE} (drone_id, ts DESC)`);
 
+    await sql.unsafe(`
+        CREATE TABLE IF NOT EXISTS ${MISSIONS_TABLE} (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            elapsed_seconds INTEGER NOT NULL DEFAULT 0,
+            results TEXT NOT NULL
+        )
+    `);
+
+    await sql.unsafe(`CREATE INDEX IF NOT EXISTS idx_missions_created_at ON ${MISSIONS_TABLE} (created_at DESC)`);
+
     const ensureColumn = async (tableName, columnName, columnType) => {
         const columns = await sql.unsafe(`PRAGMA table_info(${tableName})`);
         if (!columns.some((column) => column.name === columnName)) {
@@ -105,6 +208,8 @@ const initializeDatabase = async () => {
     await ensureColumn(TELEMETRY_TABLE, 'sniffer', 'REAL');
     await ensureColumn(TELEMETRY_TABLE, 'purway', 'REAL');
     await ensureColumn(TELEMETRY_TABLE, 'distance', 'REAL');
+    await ensureColumn(TELEMETRY_TABLE, 'remote_synced', 'INTEGER NOT NULL DEFAULT 0');
+    await ensureColumn(TELEMETRY_TABLE, 'remote_synced_at', 'TEXT');
 
     await sql.unsafe(`
         CREATE TABLE IF NOT EXISTS ${LATEST_STATE_TABLE} (
@@ -180,6 +285,14 @@ const parseDroneId = (topic, payload) => {
     return topicParts[0] || 'unknown-drone';
 };
 
+const resolveTopic = (payload, fallbackTopic) => {
+    if (typeof payload.topic === 'string' && payload.topic.trim()) {
+        return payload.topic.trim();
+    }
+
+    return fallbackTopic;
+};
+
 const normalizeTelemetry = (topic, rawPayload) => {
     const droneId = parseDroneId(topic, rawPayload);
     const ts = parseTimestamp(rawPayload.timestamp || rawPayload.ts || rawPayload.time);
@@ -231,24 +344,35 @@ const normalizeTelemetry = (topic, rawPayload) => {
     };
 };
 
-const telemetryToClientPayload = (telemetry) => ({
-    drone_id: telemetry.droneId,
-    topic: telemetry.topic,
-    ts: telemetry.ts,
-    latitude: telemetry.latitude,
-    longitude: telemetry.longitude,
-    altitude: telemetry.altitude,
-    sniffer: telemetry.sniffer,
-    purway: telemetry.purway,
-    methane: telemetry.methane,
-    distance: telemetry.distance,
-    payload: telemetry.payload,
-});
+const telemetryToClientPayload = (telemetry, includeMetrics = true) => {
+    const base = {
+        drone_id: telemetry.droneId,
+        topic: telemetry.topic,
+        ts: telemetry.ts,
+        latitude: telemetry.latitude,
+        longitude: telemetry.longitude,
+        altitude: telemetry.altitude,
+    };
 
-const broadcastTelemetry = (telemetry) => {
+    if (!includeMetrics) {
+        return base;
+    }
+
+    return {
+        ...base,
+        sniffer: telemetry.sniffer,
+        purway: telemetry.purway,
+        methane: telemetry.methane,
+        distance: telemetry.distance,
+        payload: telemetry.payload,
+    };
+};
+
+const broadcastTelemetry = (telemetry, { includeMetrics = true } = {}, source) => {
     const packet = JSON.stringify({
         type: 'telemetry',
-        data: telemetryToClientPayload(telemetry),
+        source: source,
+        data: telemetryToClientPayload(telemetry, includeMetrics),
     });
 
     for (const socket of wss.clients) {
@@ -265,6 +389,100 @@ const parseQueryDate = (input) => {
 
     const date = new Date(input);
     return Number.isNaN(date.getTime()) ? null : date;
+};
+
+const toRemoteTelemetry = (row) => ({
+    localId: row.id,
+    droneId: row.drone_id,
+    topic: row.topic,
+    ts: row.ts,
+    latitude: row.latitude,
+    longitude: row.longitude,
+    altitude: row.altitude,
+    methane: row.methane,
+    sniffer: row.sniffer,
+    purway: row.purway,
+    distance: row.distance,
+    payload: parsePayload(row.payload),
+});
+
+const markTelemetrySynced = async (id) => {
+    await sql.unsafe(
+        `UPDATE ${TELEMETRY_TABLE} SET remote_synced = 1, remote_synced_at = CURRENT_TIMESTAMP WHERE id = $1`,
+        [id],
+    );
+};
+
+const hasInternetConnection = async () => {
+    try {
+        await dns.resolve(INTERNET_CHECK_HOST);
+        return true;
+    } catch {
+        return false;
+    }
+};
+
+const syncPendingTelemetryToRemote = async () => {
+    if (syncInProgress || !remoteTelemetryStore.enabled) {
+        return;
+    }
+
+    syncInProgress = true;
+
+    try {
+        while (true) {
+            const pendingRows = await sql.unsafe(
+                `
+                SELECT id, drone_id, topic, ts, latitude, longitude, altitude, methane, sniffer, purway, distance, payload
+                FROM ${TELEMETRY_TABLE}
+                WHERE remote_synced = 0
+                ORDER BY id ASC
+                LIMIT $1
+                `,
+                [REMOTE_SYNC_BATCH_SIZE],
+            );
+
+            if (pendingRows.length === 0) {
+                break;
+            }
+
+            for (const row of pendingRows) {
+                const mirrored = await remoteTelemetryStore.mirrorTelemetry(toRemoteTelemetry(row));
+                if (!mirrored) {
+                    return;
+                }
+
+                await markTelemetrySynced(row.id);
+            }
+        }
+    } catch (error) {
+        console.warn(`Pending telemetry sync failed: ${error.message}`);
+    } finally {
+        syncInProgress = false;
+    }
+};
+
+const startInternetChecker = async () => {
+    const checkConnection = async () => {
+        const wasOnline = hasInternet;
+        hasInternet = await hasInternetConnection();
+
+        if (!wasOnline && hasInternet) {
+            console.log('Internet connectivity restored. Syncing pending telemetry to Supabase...');
+            void syncPendingTelemetryToRemote();
+        }
+
+        if (wasOnline && !hasInternet) {
+            console.warn('Internet connectivity lost. Telemetry continues in local SQLite until reconnection.');
+        }
+
+        void syncPendingTelemetryToRemote();
+    };
+
+    await checkConnection();
+    internetCheckTimer = setInterval(() => {
+        void checkConnection();
+    }, INTERNET_CHECK_INTERVAL_MS);
 };
 
 const upsertTelemetry = async (telemetry) => {
@@ -284,11 +502,14 @@ const upsertTelemetry = async (telemetry) => {
 
     await sql.unsafe(
         `
-        INSERT INTO ${TELEMETRY_TABLE} (drone_id, topic, ts, latitude, longitude, altitude, methane, sniffer, purway, distance, payload)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        INSERT INTO ${TELEMETRY_TABLE} (drone_id, topic, ts, latitude, longitude, altitude, methane, sniffer, purway, distance, payload, remote_synced, remote_synced_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 0, NULL)
         `,
         values,
     );
+
+    const inserted = await sql.unsafe('SELECT last_insert_rowid() AS id');
+    const localId = inserted?.[0]?.id;
 
     await sql.unsafe(
         `
@@ -310,7 +531,53 @@ const upsertTelemetry = async (telemetry) => {
         values,
     );
 
-    void remoteTelemetryStore.mirrorTelemetry(telemetry);
+    if (remoteTelemetryStore.enabled && localId !== undefined) {
+        const mirrored = await remoteTelemetryStore.mirrorTelemetry({ ...telemetry, localId });
+        if (mirrored) {
+            await markTelemetrySynced(localId);
+        }
+    }
+};
+
+const ingestTelemetry = async ({ source, receivedTopic, rawPayload }) => {
+    const shouldPersistMeasurement = measurementState.status === 'running';
+    const telemetry = normalizeTelemetry(receivedTopic, rawPayload);
+
+    broadcastTelemetry(telemetry, { includeMetrics: true }, source);
+
+    if (!shouldPersistMeasurement) {
+        return;
+    }
+
+    if (measurementState.excludedDroneIds.has(telemetry.droneId)) {
+        return;
+    }
+
+    await upsertTelemetry(telemetry);
+    console.log(`Recorded telemetry from ${telemetry.droneId} on ${receivedTopic} via ${source}`);
+};
+
+const startUdpListener = async () => {
+    udpServer.on('error', (error) => {
+        console.error('UDP server error:', error.message);
+    });
+
+    udpServer.on('message', (message, rinfo) => {
+        try {
+            const rawPayload = JSON.parse(message.toString());
+            const receivedTopic = resolveTopic(rawPayload, UDP_TOPIC_FALLBACK);
+            void ingestTelemetry({ source: 'UDP', receivedTopic, rawPayload });
+        } catch (error) {
+            console.error('Failed to process UDP datagram:', error.message);
+        }
+    });
+
+    await new Promise((resolve) => {
+        udpServer.bind(UDP_PORT, UDP_HOST, () => {
+            console.log(`UDP listener active on ${UDP_HOST}:${UDP_PORT}`);
+            resolve();
+        });
+    });
 };
 
 const client = mqtt.connect(brokerUrl, {
@@ -334,12 +601,9 @@ client.on('connect', () => {
 
 client.on('message', async (receivedTopic, message) => {
     try {
-        const jsonObject = JSON.parse(message.toString());
-        const telemetry = normalizeTelemetry(receivedTopic, jsonObject);
-
-        await upsertTelemetry(telemetry);
-        broadcastTelemetry(telemetry);
-        console.log(`Stored telemetry from ${telemetry.droneId} on ${receivedTopic}`);
+        const rawPayload = JSON.parse(message.toString());
+        const normalizedTopic = resolveTopic(rawPayload, receivedTopic);
+        await ingestTelemetry({ source: 'MQTT', receivedTopic: normalizedTopic, rawPayload });
     } catch (error) {
         console.error('Failed to process MQTT message:', error.message);
     }
@@ -362,12 +626,132 @@ app.get('/api/health', async (_req, res) => {
         await sql`SELECT 1`;
         res.json({
             ok: true,
+            internet: hasInternet,
             mqttTopics,
+            udp: {
+                host: UDP_HOST,
+                port: UDP_PORT,
+            },
             database: 'connected',
+            measurement: measurementStatusPayload(),
             remoteDatabase: remoteTelemetryStore.getStatus(),
         });
     } catch (error) {
         res.status(500).json({ ok: false, error: error.message });
+    }
+});
+
+app.get('/api/measurement/status', (_req, res) => {
+    res.json(measurementStatusPayload());
+});
+
+app.post('/api/measurement/start', (req, res) => {
+    res.json(startMeasurement(req.body || {}));
+});
+
+app.post('/api/measurement/pause', (_req, res) => {
+    res.json(pauseMeasurement());
+});
+
+app.post('/api/measurement/resume', (_req, res) => {
+    res.json(resumeMeasurement());
+});
+
+app.post('/api/measurement/stop', (_req, res) => {
+    res.json(stopMeasurement());
+});
+
+app.post('/api/measurement/config', (req, res) => {
+    res.json(updateMeasurementConfig(req.body || {}));
+});
+
+app.post('/api/missions', async (req, res) => {
+    const mission = req.body || {};
+    const missionId = typeof mission.id === 'string' && mission.id.trim()
+        ? mission.id.trim()
+        : `mission-${Date.now()}`;
+    const missionName = typeof mission.name === 'string' && mission.name.trim()
+        ? mission.name.trim()
+        : 'Untitled Mission';
+    const missionResults = Array.isArray(mission.results) ? mission.results : [];
+    const createdAt = typeof mission.createdAt === 'string' && mission.createdAt.trim()
+        ? mission.createdAt
+        : new Date().toISOString();
+    const elapsedSeconds = Number.isFinite(Number(mission.elapsedSeconds))
+        ? Math.max(0, Math.floor(Number(mission.elapsedSeconds)))
+        : 0;
+
+    if (!missionResults.length) {
+        return res.status(400).json({ error: 'results must be a non-empty array' });
+    }
+
+    try {
+        await sql.unsafe(
+            `
+            INSERT INTO ${MISSIONS_TABLE} (id, name, created_at, elapsed_seconds, results)
+            VALUES ($1, $2, $3, $4, $5)
+            `,
+            [missionId, missionName, createdAt, elapsedSeconds, JSON.stringify(missionResults)],
+        );
+
+        res.status(201).json({
+            id: missionId,
+            name: missionName,
+            createdAt,
+            elapsedSeconds,
+            results: missionResults,
+        });
+    } catch (error) {
+        console.error('Save mission endpoint error:', error.message);
+        res.status(500).json({ error: 'Failed to save mission' });
+    }
+});
+
+app.get('/api/missions', async (_req, res) => {
+    try {
+        const result = await sql.unsafe(
+            `
+            SELECT id, name, created_at AS createdAt, elapsed_seconds AS elapsedSeconds, results
+            FROM ${MISSIONS_TABLE}
+            ORDER BY created_at DESC
+            `,
+        );
+
+        res.json({
+            data: result.map((row) => ({
+                ...row,
+                results: parsePayload(row.results),
+            })),
+        });
+    } catch (error) {
+        console.error('List missions endpoint error:', error.message);
+        res.status(500).json({ error: 'Failed to list missions' });
+    }
+});
+
+app.delete('/api/missions/:id', async (req, res) => {
+    const missionId = typeof req.params.id === 'string' ? req.params.id.trim() : '';
+
+    if (!missionId) {
+        return res.status(400).json({ error: 'Mission id is required' });
+    }
+
+    try {
+        await sql.unsafe(
+            `DELETE FROM ${MISSIONS_TABLE} WHERE id = $1`,
+            [missionId],
+        );
+        const changedRows = await sql.unsafe('SELECT changes() AS count');
+        const deletedCount = Number(changedRows?.[0]?.count ?? 0);
+
+        if (deletedCount === 0) {
+            return res.status(404).json({ error: 'Mission not found' });
+        }
+
+        return res.status(204).send();
+    } catch (error) {
+        console.error('Delete mission endpoint error:', error.message);
+        return res.status(500).json({ error: 'Failed to delete mission' });
     }
 });
 
@@ -482,8 +866,13 @@ app.post('/api/drones/:id/import-distance', async (req, res) => {
 
             if (bestRow) {
                 await sql.unsafe(
-                    `UPDATE ${TELEMETRY_TABLE} SET distance = $1 WHERE id = $2`,
+                    `UPDATE ${TELEMETRY_TABLE} SET distance = $1, remote_synced = 0, remote_synced_at = NULL WHERE id = $2`,
                     [csvDistance, bestRow.id],
+                );
+
+                await sql.unsafe(
+                    `UPDATE ${LATEST_STATE_TABLE} SET distance = $1 WHERE drone_id = $2 AND ts = $3`,
+                    [csvDistance, droneId, bestRow.ts],
                 );
                 updatedCount++;
             }
@@ -503,11 +892,33 @@ wss.on('connection', (socket) => {
 const startServer = async () => {
     await initializeDatabase();
     void remoteTelemetryStore.initialize();
+    hasInternet = await hasInternetConnection();
+    await startInternetChecker();
+    await startUdpListener();
 
     server.listen(PORT, '0.0.0.0', () => {
         console.log(`http://0.0.0.0:${PORT}`);
     });
 };
+
+const stopInternetChecker = () => {
+    if (internetCheckTimer) {
+        clearInterval(internetCheckTimer);
+        internetCheckTimer = null;
+    }
+};
+
+process.on('SIGINT', () => {
+    stopInternetChecker();
+    udpServer.close();
+    process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+    stopInternetChecker();
+    udpServer.close();
+    process.exit(0);
+});
 
 startServer().catch((error) => {
     console.error('Startup failed:', error.message);

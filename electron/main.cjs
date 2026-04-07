@@ -76,6 +76,7 @@ function startBrokerProcess() {
   brokerProcess = spawn(process.execPath, [brokerScriptPath], {
     env: {
       ...process.env,
+      APP_DATA_DIR: app.getPath('userData'),
       ELECTRON_RUN_AS_NODE: '1'
     },
     stdio: 'inherit'

@@ -36,7 +36,7 @@ function publishToTarget(entry) {
   
   let jsonObject = JSON.parse(entry.payload);
   console.log(jsonObject);
-  if (jsonObject ['drone'] == '350') {
+  if (jsonObject ['drone'] == 'M350') {
     targetTopic = targetTopics[0];
   } else if (jsonObject['drone'] == 'M400-1') {
     targetTopic = targetTopics[1];

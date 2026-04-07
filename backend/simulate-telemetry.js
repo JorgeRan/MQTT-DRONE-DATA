@@ -7,6 +7,8 @@ const brokerUrl = process.env.MQTT_BROKER_URL || 'mqtts://1ff7f31f358d46628258e8
 const mqttUsername = process.env.MQTT_USERNAME || 'EERL-MQTT';
 const mqttPassword = process.env.MQTT_PASSWORD || 'CH4Drone';
 const publishIntervalMs = Number(process.env.SIM_INTERVAL_MS || 2000);
+const simulatorVerbose = process.env.SIM_VERBOSE === 'true';
+const summaryEveryTicks = Math.max(1, Number(process.env.SIM_LOG_EVERY_TICKS || 5));
 
 const topics = (process.env.MQTT_TOPICS || 'M350/data,M400-1/data,M400-2/data')
     .split(',')
@@ -55,6 +57,9 @@ const client = mqtt.connect(brokerUrl, {
     reconnectPeriod: 1000,
 });
 
+let tickCount = 0;
+let publishedCount = 0;
+
 const jitter = (magnitude) => (Math.random() - 0.5) * magnitude;
 
 const updateDrone = (drone) => {
@@ -74,6 +79,8 @@ const updateDrone = (drone) => {
 };
 
 const publishTick = () => {
+    tickCount += 1;
+
     for (const drone of drones) {
         updateDrone(drone);
 
@@ -95,8 +102,18 @@ const publishTick = () => {
                 return;
             }
 
-            console.log(`Published ${drone.droneId} -> ${drone.topic}`);
+            publishedCount += 1;
+
+            if (simulatorVerbose) {
+                console.log(`Published ${drone.droneId} -> ${drone.topic}`);
+            }
         });
+    }
+
+    if (!simulatorVerbose && tickCount % summaryEveryTicks === 0) {
+        console.log(
+            `[sim] ticks=${tickCount} published=${publishedCount} topics=${topics.length} interval=${publishIntervalMs}ms`,
+        );
     }
 };
 

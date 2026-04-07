@@ -89,7 +89,7 @@ function clampSelection(selection, dataLength, maxPpm) {
   };
 }
 
-export function FlowChart({ flowData, selection, onSelectionChange }) {
+export function FlowChart({ flowData, selection, onSelectionChange, resultsPageMode}) {
   const chartId = useId().replace(/:/g, "");
   const navigatorRef = useRef(null);
   const ppmRangeRef = useRef(null);
@@ -122,7 +122,8 @@ export function FlowChart({ flowData, selection, onSelectionChange }) {
   const latestPoint =
     filteredData[filteredData.length - 1] ??
     windowedData[windowedData.length - 1] ??
-    flowData[dataLength - 1];
+    flowData[dataLength - 1] ??
+    { sniffer: 0, purway: 0, methane: 0 };
   const fullTicks = [
     0,
     Math.ceil(fullPeakValue * 0.35),
@@ -294,6 +295,7 @@ export function FlowChart({ flowData, selection, onSelectionChange }) {
 
   return (
     <div className="flex h-full w-full flex-col gap-3">
+      {!resultsPageMode ? 
       <div className="flex items-start justify-between gap-3">
         <div>
           <p
@@ -321,11 +323,11 @@ export function FlowChart({ flowData, selection, onSelectionChange }) {
         >
           Live
         </div>
-      </div>
+      </div> : null}
 
       <div className="grid gap-3 sm:grid-cols-2">
         {Object.entries(seriesTheme).map(([sensorKey, theme]) => {
-          const latestValue = latestPoint[sensorKey];
+          const latestValue = Number(latestPoint?.[sensorKey] ?? 0);
 
           return (
             <div
@@ -346,7 +348,7 @@ export function FlowChart({ flowData, selection, onSelectionChange }) {
                 className="mt-1 flex flex-row text-lg font-semibold leading-none"
                 style={{ color: theme.stroke }}
               >
-                {latestValue.toFixed(1)}
+                  {latestValue.toFixed(1)}
                 <p
                   className="ms-1 mt-1.5 text-[11px] uppercase tracking-[0.12em]"
                   style={{ color: color.textMuted }}

@@ -127,12 +127,12 @@ export function buildMethanePlumeDataset(traceDataset) {
         features: positiveFeatures.map((feature, index) => {
             const [sampleLon, sampleLat] = feature.geometry.coordinates
             const { methane, altitude } = feature.properties
-            const footprintRadiusMeters = 3
+            const footprintRadiusMeters = 1
             const latOffset = metersToLatitudeDegrees(footprintRadiusMeters)
             const lonOffset = metersToLongitudeDegrees(footprintRadiusMeters, sampleLat)
             const altitudeBand = altitude - minimumAltitude
             const baseHeight = 0
-            const plumeHeight = methane * 10
+            const plumeHeight = methane * 0.30
             // const plumeHeight = baseHeight + 10 + methane * 20
 
             return {

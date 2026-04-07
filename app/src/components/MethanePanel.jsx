@@ -2,7 +2,7 @@ import React from 'react'
 import { tw , color } from '../constants/tailwind'
 import { FlowChart } from "./FlowChart";
 
-export function MethanePanel({ flowData, selection, onSelectionChange }) {
+export function MethanePanel({ flowData, selection, onSelectionChange, resultsPageMode }) {
     return (
         <div className={tw.panel} style={{ backgroundColor: color.card, padding: '0.75rem' }}>
           <div className='h-full w-full'>
@@ -10,6 +10,7 @@ export function MethanePanel({ flowData, selection, onSelectionChange }) {
               flowData={flowData}
               selection={selection}
               onSelectionChange={onSelectionChange}
+              resultsPageMode={resultsPageMode}
             />
           </div>
         </div>

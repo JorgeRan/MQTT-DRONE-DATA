@@ -7,7 +7,10 @@ import { dirname } from 'node:path';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const dataDirectory = path.join(__dirname, '..', 'data');
+const runtimeDataRoot = (process.env.APP_DATA_DIR || '').trim();
+const dataDirectory = runtimeDataRoot
+  ? path.join(runtimeDataRoot, 'data')
+  : path.join(__dirname, '..', 'data');
 const databasePath = path.join(dataDirectory, 'telemetry_events.db');
 
 let dbPromise;

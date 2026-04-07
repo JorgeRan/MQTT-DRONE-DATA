@@ -136,14 +136,16 @@ export const createRemoteTelemetryStore = ({ telemetryTable, latestStateTable })
         await remoteSql.unsafe(`ALTER TABLE ${telemetryTable} ADD COLUMN IF NOT EXISTS sniffer DOUBLE PRECISION`);
         await remoteSql.unsafe(`ALTER TABLE ${telemetryTable} ADD COLUMN IF NOT EXISTS purway DOUBLE PRECISION`);
         await remoteSql.unsafe(`ALTER TABLE ${telemetryTable} ADD COLUMN IF NOT EXISTS distance DOUBLE PRECISION`);
+        await remoteSql.unsafe(`ALTER TABLE ${telemetryTable} ADD COLUMN IF NOT EXISTS source_local_id BIGINT`);
         await remoteSql.unsafe(`ALTER TABLE ${latestStateTable} ADD COLUMN IF NOT EXISTS sniffer DOUBLE PRECISION`);
         await remoteSql.unsafe(`ALTER TABLE ${latestStateTable} ADD COLUMN IF NOT EXISTS purway DOUBLE PRECISION`);
         await remoteSql.unsafe(`ALTER TABLE ${latestStateTable} ADD COLUMN IF NOT EXISTS distance DOUBLE PRECISION`);
         await remoteSql.unsafe(`CREATE INDEX IF NOT EXISTS idx_${telemetryTable}_drone_ts ON ${telemetryTable} (drone_id, ts DESC)`);
+        await remoteSql.unsafe(`CREATE UNIQUE INDEX IF NOT EXISTS idx_${telemetryTable}_source_local_id ON ${telemetryTable} (source_local_id) WHERE source_local_id IS NOT NULL`);
     };
 
     const persistTelemetry = async (executor, telemetry) => {
-        const values = [
+        const latestValues = [
             telemetry.droneId,
             telemetry.topic,
             telemetry.ts,
@@ -157,13 +159,38 @@ export const createRemoteTelemetryStore = ({ telemetryTable, latestStateTable })
             telemetry.payload,
         ];
 
-        await executor.unsafe(
-            `
-            INSERT INTO ${telemetryTable} (drone_id, topic, ts, latitude, longitude, altitude, methane, sniffer, purway, distance, payload)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-            `,
-            values,
-        );
+        const localId = Number(telemetry.localId);
+
+        if (Number.isFinite(localId)) {
+            await executor.unsafe(
+                `
+                INSERT INTO ${telemetryTable} (drone_id, topic, ts, latitude, longitude, altitude, methane, sniffer, purway, distance, payload, source_local_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                ON CONFLICT (source_local_id) WHERE source_local_id IS NOT NULL DO UPDATE
+                SET
+                    drone_id = EXCLUDED.drone_id,
+                    topic = EXCLUDED.topic,
+                    ts = EXCLUDED.ts,
+                    latitude = EXCLUDED.latitude,
+                    longitude = EXCLUDED.longitude,
+                    altitude = EXCLUDED.altitude,
+                    methane = EXCLUDED.methane,
+                    sniffer = EXCLUDED.sniffer,
+                    purway = EXCLUDED.purway,
+                    distance = EXCLUDED.distance,
+                    payload = EXCLUDED.payload
+                `,
+                [...latestValues, localId],
+            );
+        } else {
+            await executor.unsafe(
+                `
+                INSERT INTO ${telemetryTable} (drone_id, topic, ts, latitude, longitude, altitude, methane, sniffer, purway, distance, payload)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                `,
+                latestValues,
+            );
+        }
 
         await executor.unsafe(
             `
@@ -182,7 +209,7 @@ export const createRemoteTelemetryStore = ({ telemetryTable, latestStateTable })
                 distance = EXCLUDED.distance,
                 payload = EXCLUDED.payload
             `,
-            values,
+            latestValues,
         );
     };
 

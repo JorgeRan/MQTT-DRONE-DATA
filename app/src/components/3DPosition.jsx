@@ -13,7 +13,7 @@ const latitude = traceOrigin.latitude
 const longitude = traceOrigin.longitude
 const mapboxToken = import.meta.env.VITE_MAPBOX_TOKEN
 
-export function Position({ traceDataset, lowerLimit = 0, upperLimit = 5, selectedDroneId }) {
+export function Position({ traceDataset, lowerLimit = 0, upperLimit = 5, selectedDroneId, focusCoordinates }) {
   const mapContainerRef = useRef(null)
   const mapRef = useRef(null)
   const initialPlumeDatasetRef = useRef(buildMethanePlumeDataset(traceDataset))
@@ -29,6 +29,11 @@ export function Position({ traceDataset, lowerLimit = 0, upperLimit = 5, selecte
     [traceDataset],
   )
   const selectedFocusCoordinates = useMemo(() => {
+    const [liveLng, liveLat] = Array.isArray(focusCoordinates) ? focusCoordinates : []
+    if (Number.isFinite(liveLat) && Number.isFinite(liveLng)) {
+      return [liveLng, liveLat]
+    }
+
     if (!Array.isArray(traceDataset.features) || traceDataset.features.length === 0) {
       return [longitude, latitude]
     }
@@ -41,7 +46,7 @@ export function Position({ traceDataset, lowerLimit = 0, upperLimit = 5, selecte
     }
 
     return [lng, lat]
-  }, [traceDataset])
+  }, [focusCoordinates, traceDataset])
 
   useEffect(() => {
     if (!mapContainerRef.current || mapRef.current) {
