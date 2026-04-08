@@ -37,6 +37,7 @@ jobs:
         run: npm ci --prefix backend
 
       - name: Validate map token for build
+        shell: bash
         env:
           VITE_MAPBOX_TOKEN: ${{ secrets.VITE_MAPBOX_TOKEN }}
         run: |
