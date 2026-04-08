@@ -38,6 +38,8 @@ jobs:
 
       - name: Build frontend
         run: npm run build:web
+          env:
+            VITE_MAPBOX_TOKEN: ${{ secrets.VITE_MAPBOX_TOKEN }}
 
       - name: Build and publish (macOS)
         if: matrix.os == 'macos-latest'
