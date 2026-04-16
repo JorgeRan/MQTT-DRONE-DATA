@@ -66,7 +66,7 @@ export function generateMethaneTraceDataset({ centerLat, centerLon, centerAlt, s
         const backgroundNoise = Math.max(0, (Math.random() - 0.3) * 0.45)
         let sniffer = Number(Math.max(0, methaneSignal * 1.08 + backgroundNoise + (Math.random() - 0.5) * 0.18).toFixed(2))
         let purway = Number(Math.max(0, methaneSignal * 0.94 + backgroundNoise * 0.82 + (Math.random() - 0.5) * 0.16).toFixed(2))
-        let methane = Number((((sniffer + purway) / 2)).toFixed(2))
+        let methane = Number(sniffer.toFixed(2))
 
         if (methane < 0.12 || Math.random() < 0.16) {
             methane = 0

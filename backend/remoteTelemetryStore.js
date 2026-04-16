@@ -109,6 +109,8 @@ export const createRemoteTelemetryStore = ({ telemetryTable, latestStateTable })
                 latitude DOUBLE PRECISION,
                 longitude DOUBLE PRECISION,
                 altitude DOUBLE PRECISION,
+                target_latitude DOUBLE PRECISION,
+                target_longitude DOUBLE PRECISION,
                 methane DOUBLE PRECISION,
                 sniffer DOUBLE PRECISION,
                 purway DOUBLE PRECISION,
@@ -125,6 +127,8 @@ export const createRemoteTelemetryStore = ({ telemetryTable, latestStateTable })
                 latitude DOUBLE PRECISION,
                 longitude DOUBLE PRECISION,
                 altitude DOUBLE PRECISION,
+                target_latitude DOUBLE PRECISION,
+                target_longitude DOUBLE PRECISION,
                 methane DOUBLE PRECISION,
                 sniffer DOUBLE PRECISION,
                 purway DOUBLE PRECISION,
@@ -136,10 +140,14 @@ export const createRemoteTelemetryStore = ({ telemetryTable, latestStateTable })
         await remoteSql.unsafe(`ALTER TABLE ${telemetryTable} ADD COLUMN IF NOT EXISTS sniffer DOUBLE PRECISION`);
         await remoteSql.unsafe(`ALTER TABLE ${telemetryTable} ADD COLUMN IF NOT EXISTS purway DOUBLE PRECISION`);
         await remoteSql.unsafe(`ALTER TABLE ${telemetryTable} ADD COLUMN IF NOT EXISTS distance DOUBLE PRECISION`);
+        await remoteSql.unsafe(`ALTER TABLE ${telemetryTable} ADD COLUMN IF NOT EXISTS target_latitude DOUBLE PRECISION`);
+        await remoteSql.unsafe(`ALTER TABLE ${telemetryTable} ADD COLUMN IF NOT EXISTS target_longitude DOUBLE PRECISION`);
         await remoteSql.unsafe(`ALTER TABLE ${telemetryTable} ADD COLUMN IF NOT EXISTS source_local_id BIGINT`);
         await remoteSql.unsafe(`ALTER TABLE ${latestStateTable} ADD COLUMN IF NOT EXISTS sniffer DOUBLE PRECISION`);
         await remoteSql.unsafe(`ALTER TABLE ${latestStateTable} ADD COLUMN IF NOT EXISTS purway DOUBLE PRECISION`);
         await remoteSql.unsafe(`ALTER TABLE ${latestStateTable} ADD COLUMN IF NOT EXISTS distance DOUBLE PRECISION`);
+        await remoteSql.unsafe(`ALTER TABLE ${latestStateTable} ADD COLUMN IF NOT EXISTS target_latitude DOUBLE PRECISION`);
+        await remoteSql.unsafe(`ALTER TABLE ${latestStateTable} ADD COLUMN IF NOT EXISTS target_longitude DOUBLE PRECISION`);
         await remoteSql.unsafe(`CREATE INDEX IF NOT EXISTS idx_${telemetryTable}_drone_ts ON ${telemetryTable} (drone_id, ts DESC)`);
         await remoteSql.unsafe(`CREATE UNIQUE INDEX IF NOT EXISTS idx_${telemetryTable}_source_local_id ON ${telemetryTable} (source_local_id) WHERE source_local_id IS NOT NULL`);
     };
@@ -152,6 +160,8 @@ export const createRemoteTelemetryStore = ({ telemetryTable, latestStateTable })
             telemetry.latitude,
             telemetry.longitude,
             telemetry.altitude,
+            telemetry.target_latitude,
+            telemetry.target_longitude,
             telemetry.methane,
             telemetry.sniffer,
             telemetry.purway,
@@ -164,8 +174,8 @@ export const createRemoteTelemetryStore = ({ telemetryTable, latestStateTable })
         if (Number.isFinite(localId)) {
             await executor.unsafe(
                 `
-                INSERT INTO ${telemetryTable} (drone_id, topic, ts, latitude, longitude, altitude, methane, sniffer, purway, distance, payload, source_local_id)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                INSERT INTO ${telemetryTable} (drone_id, topic, ts, latitude, longitude, altitude, target_latitude, target_longitude, methane, sniffer, purway, distance, payload, source_local_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
                 ON CONFLICT (source_local_id) WHERE source_local_id IS NOT NULL DO UPDATE
                 SET
                     drone_id = EXCLUDED.drone_id,
@@ -174,6 +184,8 @@ export const createRemoteTelemetryStore = ({ telemetryTable, latestStateTable })
                     latitude = EXCLUDED.latitude,
                     longitude = EXCLUDED.longitude,
                     altitude = EXCLUDED.altitude,
+                    target_latitude = EXCLUDED.target_latitude,
+                    target_longitude = EXCLUDED.target_longitude,
                     methane = EXCLUDED.methane,
                     sniffer = EXCLUDED.sniffer,
                     purway = EXCLUDED.purway,
@@ -185,8 +197,8 @@ export const createRemoteTelemetryStore = ({ telemetryTable, latestStateTable })
         } else {
             await executor.unsafe(
                 `
-                INSERT INTO ${telemetryTable} (drone_id, topic, ts, latitude, longitude, altitude, methane, sniffer, purway, distance, payload)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                INSERT INTO ${telemetryTable} (drone_id, topic, ts, latitude, longitude, altitude, target_latitude, target_longitude, methane, sniffer, purway, distance, payload)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                 `,
                 latestValues,
             );
@@ -194,8 +206,8 @@ export const createRemoteTelemetryStore = ({ telemetryTable, latestStateTable })
 
         await executor.unsafe(
             `
-            INSERT INTO ${latestStateTable} (drone_id, topic, ts, latitude, longitude, altitude, methane, sniffer, purway, distance, payload)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            INSERT INTO ${latestStateTable} (drone_id, topic, ts, latitude, longitude, altitude, target_latitude, target_longitude, methane, sniffer, purway, distance, payload)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             ON CONFLICT (drone_id) DO UPDATE
             SET
                 topic = EXCLUDED.topic,
@@ -203,6 +215,8 @@ export const createRemoteTelemetryStore = ({ telemetryTable, latestStateTable })
                 latitude = EXCLUDED.latitude,
                 longitude = EXCLUDED.longitude,
                 altitude = EXCLUDED.altitude,
+                target_latitude = EXCLUDED.target_latitude,
+                target_longitude = EXCLUDED.target_longitude,
                 methane = EXCLUDED.methane,
                 sniffer = EXCLUDED.sniffer,
                 purway = EXCLUDED.purway,

@@ -11,6 +11,7 @@ import {
 import {
   buildHeatmapColorExpression,
   buildHeatmapWeightExpression,
+  buildHotspotHaloRadiusExpression,
   buildHotspotRadiusExpression,
   buildMethaneColorExpression,
   buildMethaneGradient,
@@ -23,6 +24,10 @@ import {
   createTelemetryWebSocket,
   waitForBackendReady,
 } from "../services/api";
+import {
+  extractTelemetryMetrics,
+  SENSOR_MODE_AERIS,
+} from "../constants/telemetryMetrics";
 import { traceOrigin } from "../data/methaneTraceData";
 import { buildMethanePlumeDataset } from "../data/methaneTraceData";
 
@@ -37,17 +42,21 @@ const toFiniteNumber = (value) => {
 };
 
 const normalizeDroneState = (entry) => ({
+  ...extractTelemetryMetrics(entry),
   drone_id: entry.drone_id,
   topic: entry.topic,
   ts: entry.ts,
   latitude: toFiniteNumber(entry.latitude),
   longitude: toFiniteNumber(entry.longitude),
   altitude: toFiniteNumber(entry.altitude),
+  target_latitude: toFiniteNumber(
+    entry.target_latitude ?? entry.payload?.target_position?.latitude,
+  ),
+  target_longitude: toFiniteNumber(
+    entry.target_longitude ?? entry.payload?.target_position?.longitude,
+  ),
   battery: toFiniteNumber(entry.battery),
   speed: toFiniteNumber(entry.speed),
-  sniffer: toFiniteNumber(entry.sniffer),
-  purway: toFiniteNumber(entry.purway),
-  methane: toFiniteNumber(entry.methane),
   payload: entry.payload || {},
 });
 
@@ -72,7 +81,10 @@ const buildDroneFeatureCollection = (drones) => ({
         speed: drone.speed,
         sniffer: drone.sniffer,
         purway: drone.purway,
-        methane: Number.isFinite(drone.purway) ? drone.purway : drone.methane,
+        acetylene: drone.acetylene,
+        nitrousOxide: drone.nitrousOxide,
+        sensorMode: drone.sensorMode,
+        methane: drone.methane,
         ts: drone.ts,
       },
     })),
@@ -135,6 +147,7 @@ export function Map({
   onScaleChange,
   selectedDroneId,
   resultsPageMode,
+  heatmapEnabled = true,
   plumeViewEnabled = false,
   onPlumeViewAutoChange,
 }) {
@@ -179,6 +192,13 @@ export function Map({
   const displayAltitude = Number.isFinite(focusedDrone?.altitude)
     ? focusedDrone.altitude
     : altitude;
+
+  const displayTargetLatitude = Number.isFinite(focusedDrone?.target_latitude)
+    ? focusedDrone.target_latitude
+    : latitude;
+  const displayTargetLongitude = Number.isFinite(focusedDrone?.target_longitude)
+    ? focusedDrone.target_longitude
+    : longitude;
 
   const handleLimitChange = (limitType, rawValue) => {
     const nextValue = rawValue.replace(",", ".");
@@ -278,14 +298,18 @@ export function Map({
       markerElement.style.border = `3px solid ${color.orange}`;
       markerElement.style.boxShadow = `0 0 0 8px rgba(253, 148, 86, 0.28), 0 10px 22px rgba(0, 0, 0, 0.42)`;
 
-      const markerImage = document.createElement("div");
-      markerImage.style.width = "52px";
-      markerImage.style.height = "52px";
-      markerImage.style.backgroundImage = `url(${m350Marker})`;
-      markerImage.style.backgroundPosition = "center";
-      markerImage.style.backgroundRepeat = "no-repeat";
-      markerImage.style.backgroundSize = "contain";
+      const markerImage = document.createElement("img");
+      markerImage.src = m350Marker;
+      markerImage.alt = "Drone";
+      markerImage.draggable = false;
+      markerImage.style.width = "40px";
+      markerImage.style.height = "40px";
+      markerImage.style.objectFit = "contain";
       markerImage.style.filter = "drop-shadow(0 3px 6px rgba(0, 0, 0, 0.24))";
+
+      markerImage.onerror = () => {
+        markerImage.style.display = "none";
+      };
 
       markerElement.appendChild(markerImage);
 
@@ -326,6 +350,11 @@ export function Map({
 
       const initialLowerLimit = initialLowerLimitRef.current;
       const initialUpperLimit = initialUpperLimitRef.current;
+      const initialSpan = Math.max(
+        initialUpperLimit - initialLowerLimit,
+        minimumLegendSpan,
+      );
+      const initialHeatmapThreshold = initialLowerLimit + initialSpan * 0.04;
 
       map.addSource("methane-traces", {
         type: "geojson",
@@ -336,7 +365,7 @@ export function Map({
         id: "methane-trace-heatmap",
         type: "heatmap",
         source: "methane-traces",
-        filter: [">", ["get", "methane"], 0],
+        filter: [">=", ["get", "methane"], initialHeatmapThreshold],
         paint: {
           "heatmap-weight": buildHeatmapWeightExpression(
             initialLowerLimit,
@@ -347,9 +376,9 @@ export function Map({
             ["linear"],
             ["zoom"],
             13,
-            0.65,
+            0.85,
             18,
-            1.25,
+            1.65,
           ],
           "heatmap-color": buildHeatmapColorExpression(
             initialLowerLimit,
@@ -360,11 +389,19 @@ export function Map({
             ["linear"],
             ["zoom"],
             13,
+            12,
             18,
-            18,
-            34,
+            28,
           ],
-          "heatmap-opacity": plumeViewEnabled ? 0.2 : 0,
+          "heatmap-opacity": resultsPageMode
+            ? heatmapEnabled
+              ? 0.78
+              : 0
+            : plumeViewEnabled
+              ? heatmapEnabled
+                ? 0.2
+                : 0
+              : 0,
         },
       });
 
@@ -386,7 +423,11 @@ export function Map({
           ],
           "circle-stroke-width": 0.9,
           "circle-stroke-color": "rgba(255,255,255,0.72)",
-          "circle-opacity": plumeViewEnabled ? 0.15 : 0.88,
+          "circle-opacity": resultsPageMode
+            ? 0.18
+            : plumeViewEnabled
+              ? 0.15
+              : 0.88,
         },
       });
 
@@ -406,7 +447,40 @@ export function Map({
           ),
           "circle-stroke-width": 1,
           "circle-stroke-color": "rgba(255,255,255,0.9)",
-          "circle-opacity": plumeViewEnabled ? 0.15 : 0.8,
+          "circle-opacity": resultsPageMode
+            ? 0.95
+            : plumeViewEnabled
+              ? 0.15
+              : 0.8,
+        },
+      });
+
+      map.addLayer({
+        id: "methane-trace-halo",
+        type: "circle",
+        source: "methane-traces",
+        filter: [">", ["get", "methane"], 0],
+        paint: {
+          "circle-color": buildMethaneColorExpression(
+            initialLowerLimit,
+            initialUpperLimit,
+          ),
+          "circle-radius": buildHotspotHaloRadiusExpression(
+            initialLowerLimit,
+            initialUpperLimit,
+          ),
+          "circle-blur": 0.72,
+          "circle-opacity": resultsPageMode
+            ? heatmapEnabled
+              ? 0.46
+              : 0
+            : plumeViewEnabled
+              ? heatmapEnabled
+                ? 0.1
+                : 0
+              : heatmapEnabled
+                ? 0.36
+                : 0,
         },
       });
 
@@ -487,13 +561,18 @@ export function Map({
 
           const {
             methane,
+            ch4,
             averageMethane,
             sniffer,
             purway,
+            acetylene,
+            nitrousOxide,
+            sensorMode,
             altitude: pointAltitude,
             sampleIndex,
             timeLabel,
           } = hoveredFeature.properties;
+          const isAerisTrace = sensorMode === SENSOR_MODE_AERIS;
           map.getCanvas().style.cursor = "pointer";
           popupRef.current
             .setLngLat(event.lngLat)
@@ -501,10 +580,19 @@ export function Map({
               `
                             <div style="min-width: 148px; color: #e5eef8;">
                                 <div style="font-size: 10px; text-transform: uppercase; letter-spacing: 0.14em; color: #9fb0c2;">Sample ${sampleIndex}</div>
-                                <div style="margin-top: 4px; font-size: 13px; font-weight: 700; color: #ffffff;">Purway ${Number(methane).toFixed(2)}</div>
-                                <div style="margin-top: 2px; font-size: 12px; color: #d2dce8;">Sniffer ${Number(sniffer ?? 0).toFixed(2)} ppm</div>
-                                <div style="margin-top: 2px; font-size: 12px; color: #d2dce8;">CH4 avg ${Number(averageMethane ?? methane).toFixed(2)}</div>
-                                <div style="margin-top: 2px; font-size: 12px; color: #d2dce8;">Purway raw ${Number(purway ?? methane).toFixed(2)}</div>
+                                <div style="margin-top: 4px; font-size: 13px; font-weight: 700; color: #ffffff;">${isAerisTrace ? "CH4" : "Purway"} ${Number(methane ?? 0).toFixed(2)} ${isAerisTrace ? "ppm" : "ppm-m"}</div>
+                                ${
+                                  isAerisTrace
+                                    ? ""
+                                    : `<div style="margin-top: 2px; font-size: 12px; color: #d2dce8;">CH4 ${Number(ch4 ?? 0).toFixed(2)} ppm</div>`
+                                }
+                                ${
+                                  isAerisTrace
+                                    ? `<div style="margin-top: 2px; font-size: 12px; color: #d2dce8;">Acetylene ${Number(acetylene ?? 0).toFixed(2)} ppm</div>
+                                <div style="margin-top: 2px; font-size: 12px; color: #d2dce8;">Nitrous Oxide ${Number(nitrousOxide ?? 0).toFixed(2)} ppm</div>`
+                                    : `<div style="margin-top: 2px; font-size: 12px; color: #d2dce8;">Sniffer ${Number(sniffer ?? 0).toFixed(2)} ppm</div>
+                                  <div style="margin-top: 2px; font-size: 12px; color: #d2dce8;">Purway ${Number(purway ?? 0).toFixed(2)} ppm-m</div>`
+                                }
                                 <div style="margin-top: 4px; font-size: 12px; color: #d2dce8;">Altitude ${Number(pointAltitude).toFixed(0)} m</div>
                                 <div style="margin-top: 2px; font-size: 11px; color: #9fb0c2;">Flight mark ${timeLabel}</div>
                             </div>
@@ -537,8 +625,12 @@ export function Map({
           methane,
           sniffer,
           purway,
+          acetylene,
+          nitrousOxide,
+          sensorMode,
           ts,
         } = feature.properties;
+        const isAerisDrone = sensorMode === SENSOR_MODE_AERIS;
         map.getCanvas().style.cursor = "pointer";
 
         popupRef.current
@@ -550,8 +642,14 @@ export function Map({
                             <div style="margin-top: 4px; font-size: 12px; color: #ffffff;">Alt ${Number(liveAltitude || 0).toFixed(1)} m</div>
                             <div style="margin-top: 2px; font-size: 12px; color: #d2dce8;">Battery ${battery ?? "-"}%</div>
                             <div style="margin-top: 2px; font-size: 12px; color: #d2dce8;">Speed ${speed ?? "-"} m/s</div>
-                            <div style="margin-top: 2px; font-size: 12px; color: #d2dce8;">Purway ${purway ?? methane ?? "-"} ppm</div>
-                            <div style="margin-top: 2px; font-size: 12px; color: #d2dce8;">Sniffer ${sniffer ?? "-"} ppm</div>
+                            <div style="margin-top: 2px; font-size: 12px; color: #d2dce8;">CH4 ${methane ?? "-"} ppm</div>
+                            ${
+                              isAerisDrone
+                                ? `<div style="margin-top: 2px; font-size: 12px; color: #d2dce8;">Acetylene ${acetylene ?? "-"} ppm</div>
+                            <div style="margin-top: 2px; font-size: 12px; color: #d2dce8;">Nitrous Oxide ${nitrousOxide ?? "-"} ppm</div>`
+                                : `<div style="margin-top: 2px; font-size: 12px; color: #d2dce8;">Purway ${purway ?? "-"} ppm-m</div>
+                            <div style="margin-top: 2px; font-size: 12px; color: #d2dce8;">Sniffer ${sniffer ?? "-"} ppm</div>`
+                            }
                             <div style="margin-top: 2px; font-size: 11px; color: #9fb0c2;">${ts ? new Date(ts).toLocaleString() : ""}</div>
                         </div>
                     `,
@@ -637,7 +735,10 @@ export function Map({
       });
     }
 
-    primaryMarkerRef.current?.setLngLat([displayLongitude, displayLatitude]);
+    primaryMarkerRef.current?.setLngLat([
+      displayTargetLongitude,
+      displayTargetLatitude,
+    ]);
   }, [displayLatitude, displayLongitude, focusedDrone, resultsPageMode]);
 
   useEffect(() => {
@@ -682,6 +783,7 @@ export function Map({
       !currentMap.getLayer("methane-trace-heatmap") ||
       !currentMap.getLayer("methane-trace-zero-points") ||
       !currentMap.getLayer("methane-trace-hotspots") ||
+      !currentMap.getLayer("methane-trace-halo") ||
       !currentMap.getLayer("methane-plume-columns") ||
       !currentMap.getLayer("methane-plume-caps")
     ) {
@@ -694,18 +796,54 @@ export function Map({
     }
 
     const startHeatmapOpacity = Number(
-      currentMap.getPaintProperty("methane-trace-heatmap", "heatmap-opacity") ?? 0,
+      currentMap.getPaintProperty("methane-trace-heatmap", "heatmap-opacity") ??
+        0,
     );
     const startZeroOpacity = Number(
-      currentMap.getPaintProperty("methane-trace-zero-points", "circle-opacity") ?? 0.88,
+      currentMap.getPaintProperty(
+        "methane-trace-zero-points",
+        "circle-opacity",
+      ) ?? 0.88,
     );
     const startHotspotOpacity = Number(
-      currentMap.getPaintProperty("methane-trace-hotspots", "circle-opacity") ?? 0.8,
+      currentMap.getPaintProperty("methane-trace-hotspots", "circle-opacity") ??
+        0.8,
+    );
+    const startHaloOpacity = Number(
+      currentMap.getPaintProperty("methane-trace-halo", "circle-opacity") ??
+        0.36,
     );
 
-    const targetHeatmapOpacity = plumeViewEnabled ? 0.2 : 0;
-    const targetZeroOpacity = plumeViewEnabled ? 0.15 : 0.88;
-    const targetHotspotOpacity = plumeViewEnabled ? 0.15 : 0.8;
+    const targetHeatmapOpacity = resultsPageMode
+      ? heatmapEnabled
+        ? 0.78
+        : 0
+      : plumeViewEnabled
+        ? heatmapEnabled
+          ? 0.2
+          : 0
+        : 0;
+    const targetZeroOpacity = resultsPageMode
+      ? 0.18
+      : plumeViewEnabled
+        ? 0.15
+        : 0.88;
+    const targetHotspotOpacity = resultsPageMode
+      ? 0.95
+      : plumeViewEnabled
+        ? 0.15
+        : 0.8;
+    const targetHaloOpacity = resultsPageMode
+      ? heatmapEnabled
+        ? 0.46
+        : 0
+      : plumeViewEnabled
+        ? heatmapEnabled
+          ? 0.1
+          : 0
+        : heatmapEnabled
+          ? 0.36
+          : 0;
     const startPlumeOpacity = Number(
       currentMap.getPaintProperty(
         "methane-plume-columns",
@@ -727,7 +865,8 @@ export function Map({
       currentMap.setPaintProperty(
         "methane-trace-heatmap",
         "heatmap-opacity",
-        startHeatmapOpacity + (targetHeatmapOpacity - startHeatmapOpacity) * eased,
+        startHeatmapOpacity +
+          (targetHeatmapOpacity - startHeatmapOpacity) * eased,
       );
       currentMap.setPaintProperty(
         "methane-trace-zero-points",
@@ -737,7 +876,13 @@ export function Map({
       currentMap.setPaintProperty(
         "methane-trace-hotspots",
         "circle-opacity",
-        startHotspotOpacity + (targetHotspotOpacity - startHotspotOpacity) * eased,
+        startHotspotOpacity +
+          (targetHotspotOpacity - startHotspotOpacity) * eased,
+      );
+      currentMap.setPaintProperty(
+        "methane-trace-halo",
+        "circle-opacity",
+        startHaloOpacity + (targetHaloOpacity - startHaloOpacity) * eased,
       );
       currentMap.setPaintProperty(
         "methane-plume-columns",
@@ -771,9 +916,7 @@ export function Map({
 
     if (mapMode === "online") {
       currentMap.setTerrain(
-        plumeViewEnabled
-          ? { source: "mapbox-dem", exaggeration: 1.35 }
-          : null,
+        plumeViewEnabled ? { source: "mapbox-dem", exaggeration: 1.35 } : null,
       );
     }
 
@@ -783,7 +926,7 @@ export function Map({
         plumeTransitionFrameRef.current = null;
       }
     };
-  }, [mapMode, plumeViewEnabled, resultsPageMode]);
+  }, [heatmapEnabled, mapMode, plumeViewEnabled, resultsPageMode]);
 
   useEffect(() => {
     const currentMap = mapRef.current;
@@ -909,6 +1052,7 @@ export function Map({
       !currentMap ||
       !currentMap.getLayer("methane-trace-heatmap") ||
       !currentMap.getLayer("methane-trace-hotspots") ||
+      !currentMap.getLayer("methane-trace-halo") ||
       !currentMap.getLayer("methane-plume-columns")
     ) {
       return;
@@ -930,10 +1074,28 @@ export function Map({
       buildMethaneColorExpression(lowerLimit, upperLimit),
     );
     currentMap.setPaintProperty(
+      "methane-trace-halo",
+      "circle-color",
+      buildMethaneColorExpression(lowerLimit, upperLimit),
+    );
+    currentMap.setPaintProperty(
       "methane-trace-hotspots",
       "circle-radius",
       buildHotspotRadiusExpression(lowerLimit, upperLimit),
     );
+    currentMap.setPaintProperty(
+      "methane-trace-halo",
+      "circle-radius",
+      buildHotspotHaloRadiusExpression(lowerLimit, upperLimit),
+    );
+
+    const span = Math.max(upperLimit - lowerLimit, minimumLegendSpan);
+    const heatmapThreshold = lowerLimit + span * 0.04;
+    currentMap.setFilter("methane-trace-heatmap", [
+      ">=",
+      ["get", "methane"],
+      heatmapThreshold,
+    ]);
     currentMap.setPaintProperty(
       "methane-plume-columns",
       "fill-extrusion-color",

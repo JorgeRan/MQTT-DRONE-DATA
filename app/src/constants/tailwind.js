@@ -39,4 +39,5 @@ export const color = {
   transparent: '#ffffff00',
   red: '#f87171',
   saveGreen: '#45b954',
+  blue: '#6ab2ff'
 }

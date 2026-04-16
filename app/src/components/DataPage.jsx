@@ -1,18 +1,47 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { color } from "../constants/tailwind";
-import { Trash2, RefreshCcw } from "lucide-react";
-import { backendHttpUrl } from "../services/api";
+import { RefreshCcw } from "lucide-react";
+import { listMissions } from "../services/api";
+import { CSVImportModal } from "./CSVModal";
+import {
+  extractTelemetryMetrics,
+  toFiniteNumber,
+} from "../constants/telemetryMetrics";
 
 const PAGE_SIZE = 25;
+const ALL_MISSIONS_OPTION = "ALL_MISSIONS";
+const ALL_DRONES_OPTION = "ALL_DRONES";
 
 const COLUMNS = [
   { key: "sampleIndex", label: "#", align: "right", width: "3rem" },
   { key: "time", label: "Time", align: "left", width: "7rem" },
   {
+    key: "sensorMode",
+    label: "Sensor",
+    align: "left",
+    width: "6.5rem",
+  },
+  {
     key: "methane",
-    label: "CH4 avg",
+    label: "Methane",
     align: "right",
     width: "6rem",
+    unit: "ppm",
+    decimals: 3,
+  },
+  {
+    key: "acetylene",
+    label: "Acetylene",
+    align: "right",
+    width: "6.5rem",
+    unit: "ppm",
+    decimals: 3,
+  },
+  {
+    key: "ethylene",
+    label: "Ethylene",
+    align: "right",
+    width: "6.5rem",
     unit: "ppm",
     decimals: 3,
   },
@@ -29,7 +58,7 @@ const COLUMNS = [
     label: "Purway",
     align: "right",
     width: "6rem",
-    unit: "ppb",
+    unit: "ppm-m",
     decimals: 3,
   },
   {
@@ -192,8 +221,71 @@ function exportCsv(rows, droneId) {
   URL.revokeObjectURL(url);
 }
 
+const normalizeMissionPoint = (point, index, droneId) => {
+  const metrics = extractTelemetryMetrics(point);
+  const timestampIso =
+    point?.timestampIso ||
+    point?.ts ||
+    point?.timestamp ||
+    new Date().toISOString();
+  const rawTimestampMs = Number(point?.timestampMs);
+  const derivedTimestampMs = new Date(timestampIso).getTime();
+  const timestampMs = Number.isFinite(rawTimestampMs)
+    ? rawTimestampMs
+    : Number.isFinite(derivedTimestampMs)
+      ? derivedTimestampMs
+      : Date.now();
+
+  return {
+    sampleOrder: index,
+    sampleIndex: index + 1,
+    timestampMs,
+    timestampIso,
+    time:
+      point?.time ||
+      new Date(timestampMs).toLocaleTimeString([], {
+        hour: "numeric",
+        minute: "2-digit",
+        second: "2-digit",
+      }),
+    altitude: toFiniteNumber(point?.altitude),
+    latitude: toFiniteNumber(point?.latitude),
+    longitude: toFiniteNumber(point?.longitude),
+    distance: toFiniteNumber(point?.distance),
+    wind_u: toFiniteNumber(point?.wind_u),
+    wind_v: toFiniteNumber(point?.wind_v),
+    wind_w: toFiniteNumber(point?.wind_w),
+    sensorMode: metrics.sensorMode,
+    sniffer: metrics.sniffer,
+    purway: metrics.purway,
+    methane: metrics.methane,
+    acetylene: metrics.acetylene,
+    ethylene:
+      toFiniteNumber(point?.ethylene) ?? toFiniteNumber(point?.nitrousOxide),
+    nitrousOxide: metrics.nitrousOxide,
+    droneId,
+  };
+};
+
+const flattenMissionRows = (results) =>
+  (Array.isArray(results) ? results : [])
+    .flatMap((entry) => {
+      const droneId = entry?.drone || "unknown-drone";
+      const data = Array.isArray(entry?.data) ? entry.data : [];
+      return data.map((point, index) =>
+        normalizeMissionPoint(point, index, droneId),
+      );
+    })
+    .sort((a, b) => a.timestampMs - b.timestampMs)
+    .map((point, index) => ({
+      ...point,
+      sampleOrder: index,
+      sampleIndex: index + 1,
+    }));
+
 export function DataPage({
   devices,
+  sensorsMode,
   flowDataByDrone,
   selectedDeviceId,
   onSelectDevice,
@@ -204,83 +296,30 @@ export function DataPage({
   const [sortDir, setSortDir] = useState("asc");
   const [page, setPage] = useState(0);
   const [filter, setFilter] = useState("");
-  const [selectedFile, setSelectedFile] = useState(null);
-  const [importStatus, setImportStatus] = useState(null);
+  const [csvModalFile, setCsvModalFile] = useState(null);
+  const [importMessage, setImportMessage] = useState(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [refreshMessage, setRefreshMessage] = useState(null);
+  const [missionsSample, setMissionsSample] = useState([]);
+  const [selectedMissionId, setSelectedMissionId] = useState(ALL_MISSIONS_OPTION);
+  const [selectedDroneFilterId, setSelectedDroneFilterId] = useState(
+    selectedDeviceId || ALL_DRONES_OPTION,
+  );
 
-  const importCsv = () => {
+  const loadMissions = useCallback(async () => {
+    const loadedMissions = await listMissions();
+    setMissionsSample(loadedMissions);
+  }, []);
+
+  const openCsvPicker = () => {
     const input = document.createElement("input");
     input.type = "file";
     input.accept = ".csv,text/csv";
     input.onchange = (event) => {
       const file = event.target.files?.[0] || null;
-      setSelectedFile(file);
-      setImportStatus(null);
+      if (file) setCsvModalFile(file);
     };
     input.click();
-  };
-
-  const mergeData = async () => {
-    if (!selectedFile) return;
-    setImportStatus("Parsing…");
-    try {
-      const text = await selectedFile.text();
-      const lines = text.trim().split("\n");
-      if (lines.length < 2) {
-        setImportStatus("Error: CSV is empty");
-        return;
-      }
-      const headers = lines[0].split(",").map((h) => h.trim());
-      const timeIdx = headers.indexOf("time");
-      const methaneIdx = headers.indexOf("methane_concentration");
-      const distanceIdx = headers.indexOf("distance");
-      if (timeIdx === -1 || distanceIdx === -1) {
-        setImportStatus("Error: CSV must have 'time' and 'distance' columns");
-        return;
-      }
-      const rows = [];
-      for (const line of lines.slice(1)) {
-        if (!line.trim()) continue;
-        const cols = line.split(",");
-        const rawTime = cols[timeIdx]?.trim();
-        if (!rawTime) continue;
-        // Parse "2026-03-10_00:55:57:164" → ISO UTC
-        const [datePart, timePart] = rawTime.split("_");
-        const tp = timePart?.split(":");
-        if (!tp || tp.length < 4) continue;
-        const isoTime = `${datePart}T${tp[0]}:${tp[1]}:${tp[2]}.${tp[3]}Z`;
-        const tsMs = new Date(isoTime).getTime();
-        if (!Number.isFinite(tsMs)) continue;
-        const methane = parseFloat(cols[methaneIdx]) || 0;
-        const distance = parseFloat(cols[distanceIdx]);
-        if (!Number.isFinite(distance)) continue;
-        rows.push({ tsMs, methane, distance });
-      }
-      if (rows.length === 0) {
-        setImportStatus("Error: no valid rows found in CSV");
-        return;
-      }
-      setImportStatus(`Uploading ${rows.length} rows…`);
-      const response = await fetch(
-        `${backendHttpUrl}/api/drones/${selectedDeviceId}/import-distance`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ rows }),
-        },
-      );
-      if (!response.ok) {
-        const err = await response.json().catch(() => ({}));
-        setImportStatus(`Error: ${err.error || response.statusText}`);
-        return;
-      }
-      const result = await response.json();
-      setImportStatus(`Done: ${result.updated}/${result.total} rows matched`);
-      onImportComplete?.();
-    } catch (err) {
-      setImportStatus(`Error: ${err.message}`);
-    }
   };
 
   const refreshData = async () => {
@@ -292,6 +331,7 @@ export function DataPage({
     setRefreshMessage({ tone: "info", text: "Refreshing telemetry..." });
     try {
       const refreshed = await onRefresh();
+      await loadMissions();
       setRefreshMessage(
         refreshed
           ? { tone: "success", text: "Data refreshed from backend" }
@@ -305,6 +345,20 @@ export function DataPage({
   };
 
   useEffect(() => {
+    void loadMissions();
+  }, [loadMissions]);
+
+  useEffect(() => {
+    if (!selectedDeviceId) {
+      return;
+    }
+
+    setSelectedDroneFilterId((currentValue) =>
+      currentValue === ALL_DRONES_OPTION ? currentValue : selectedDeviceId,
+    );
+  }, [selectedDeviceId]);
+
+  useEffect(() => {
     if (!refreshMessage || refreshMessage.tone === "info") {
       return undefined;
     }
@@ -316,10 +370,115 @@ export function DataPage({
     return () => window.clearTimeout(timeoutId);
   }, [refreshMessage]);
 
-  const rawRows = useMemo(
-    () => flowDataByDrone[selectedDeviceId] || [],
-    [flowDataByDrone, selectedDeviceId],
+  const allDataRows = useMemo(() => {
+    return Object.entries(flowDataByDrone)
+      .flatMap(([droneId, rows]) => {
+        const safeRows = Array.isArray(rows) ? rows : [];
+        return safeRows.map((row, index) =>
+          normalizeMissionPoint(row, index, row?.droneId || droneId),
+        );
+      })
+      .sort((a, b) => a.timestampMs - b.timestampMs)
+      .map((row, index) => ({
+        ...row,
+        sampleOrder: index,
+        sampleIndex: index + 1,
+      }));
+  }, [flowDataByDrone]);
+
+  const missions = useMemo(() => {
+    return missionsSample
+      .map((mission) => {
+        const flowData = flattenMissionRows(mission?.results);
+        const droneIds = Array.from(
+          new Set(flowData.map((point) => point.droneId).filter(Boolean)),
+        );
+
+        return {
+          id: mission.id,
+          name: mission.name || "Untitled Mission",
+          createdAt: mission.createdAt || null,
+          flowData,
+          droneIds,
+          sampleCount: flowData.length,
+        };
+      })
+      .filter((mission) => mission.sampleCount > 0);
+  }, [missionsSample]);
+
+  const missionOptions = useMemo(() => {
+    const allDataDroneIds = Array.from(
+      new Set(allDataRows.map((row) => row.droneId).filter(Boolean)),
+    );
+
+    return [
+      {
+        id: ALL_MISSIONS_OPTION,
+        name: "All Data",
+        flowData: allDataRows,
+        droneIds: allDataDroneIds,
+        sampleCount: allDataRows.length,
+      },
+      ...missions,
+    ];
+  }, [allDataRows, missions]);
+
+  const selectedMission = useMemo(
+    () =>
+      missionOptions.find((mission) => mission.id === selectedMissionId) ||
+      missionOptions[0] ||
+      null,
+    [missionOptions, selectedMissionId],
   );
+
+  useEffect(() => {
+    if (!missionOptions.length) {
+      setSelectedMissionId(ALL_MISSIONS_OPTION);
+      return;
+    }
+
+    const missionExists = missionOptions.some(
+      (mission) => mission.id === selectedMissionId,
+    );
+
+    if (!missionExists) {
+      setSelectedMissionId(missionOptions[0].id);
+    }
+  }, [missionOptions, selectedMissionId]);
+
+  const droneOptions = useMemo(() => {
+    const droneIds = selectedMission?.droneIds || [];
+    return [
+      { id: ALL_DRONES_OPTION, name: "All Drones" },
+      ...droneIds.map((droneId) => {
+        const deviceMatch = devices.find((device) => device.id === droneId);
+        return {
+          id: droneId,
+          name: deviceMatch?.name || droneId,
+        };
+      }),
+    ];
+  }, [devices, selectedMission]);
+
+  useEffect(() => {
+    const droneExists = droneOptions.some(
+      (drone) => drone.id === selectedDroneFilterId,
+    );
+
+    if (!droneExists) {
+      setSelectedDroneFilterId(ALL_DRONES_OPTION);
+    }
+  }, [droneOptions, selectedDroneFilterId]);
+
+  const rawRows = useMemo(() => {
+    const sourceRows = selectedMission?.flowData || [];
+
+    if (selectedDroneFilterId === ALL_DRONES_OPTION) {
+      return sourceRows;
+    }
+
+    return sourceRows.filter((row) => row.droneId === selectedDroneFilterId);
+  }, [selectedDroneFilterId, selectedMission]);
 
   const filteredRows = useMemo(() => {
     if (!filter.trim()) return rawRows;
@@ -375,6 +534,7 @@ export function DataPage({
   };
 
   return (
+    <>
     <div className="flex w-full flex-col gap-4 p-3">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-row items-center gap-4">
@@ -447,9 +607,10 @@ export function DataPage({
         <div className="flex flex-wrap items-center gap-2">
           <div className="relative">
             <select
-              value={selectedDeviceId}
+              value={selectedMissionId}
               onChange={(e) => {
-                onSelectDevice(e.target.value);
+                setSelectedMissionId(e.target.value);
+                setSelectedDroneFilterId(ALL_DRONES_OPTION);
                 setPage(0);
               }}
               className="appearance-none rounded-lg border py-2 pl-3 pr-8 text-sm font-medium focus:outline-none"
@@ -459,13 +620,60 @@ export function DataPage({
                 color: color.text,
               }}
             >
-              {devices.map((d) => (
+              {missionOptions.map((mission) => (
                 <option
-                  key={d.id}
-                  value={d.id}
+                  key={mission.id}
+                  value={mission.id}
                   style={{ backgroundColor: color.card }}
                 >
-                  {d.name}
+                  {mission.name}
+                </option>
+              ))}
+            </select>
+            <svg
+              className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2"
+              width="12"
+              height="12"
+              viewBox="0 0 12 12"
+              fill="none"
+            >
+              <path
+                d="M2 4l4 4 4-4"
+                stroke={color.textMuted}
+                strokeWidth="1.5"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </svg>
+          </div>
+          <div className="relative">
+            <select
+              value={selectedDroneFilterId}
+              onChange={(e) => {
+                const nextDroneId = e.target.value;
+                setSelectedDroneFilterId(nextDroneId);
+                if (
+                  nextDroneId !== ALL_DRONES_OPTION &&
+                  typeof onSelectDevice === "function"
+                ) {
+                  onSelectDevice(nextDroneId);
+                }
+                setPage(0);
+              }}
+              className="appearance-none rounded-lg border py-2 pl-3 pr-8 text-sm font-medium focus:outline-none"
+              style={{
+                backgroundColor: color.card,
+                borderColor: color.borderStrong,
+                color: color.text,
+              }}
+            >
+              {droneOptions.map((drone) => (
+                <option
+                  key={drone.id}
+                  value={drone.id}
+                  style={{ backgroundColor: color.card }}
+                >
+                  {drone.name}
                 </option>
               ))}
             </select>
@@ -505,7 +713,12 @@ export function DataPage({
 
           <button
             type="button"
-            onClick={() => exportCsv(sortedRows, selectedDeviceId)}
+            onClick={() =>
+              exportCsv(
+                sortedRows,
+                `${selectedMission?.name || "all-data"}_${selectedDroneFilterId}`,
+              )
+            }
             className="flex items-center gap-1.5 rounded-lg border px-3 py-2 text-sm font-medium transition-colors"
             style={{
               backgroundColor: color.surface,
@@ -526,7 +739,7 @@ export function DataPage({
           </button>
           <button
             type="button"
-            onClick={() => importCsv()}
+            onClick={openCsvPicker}
             className="flex items-center gap-1.5 rounded-lg border px-3 py-2 text-sm font-medium transition-colors"
             style={{
               backgroundColor: color.surface,
@@ -552,47 +765,17 @@ export function DataPage({
             Upload CSV
           </button>
 
-          {selectedFile && (
-            <div className="flex flex-col gap-1">
-              <div className="flex flex-row items-center gap-6">
-                <div className="flex flex-row items-center gap-1">
-                  <span className="text-xs" style={{ color: color.textDim }}>
-                    {selectedFile.name}
-                  </span>
-                  <button onClick={() => setSelectedFile(null)}>
-                    <Trash2
-                      width={20}
-                      height={20}
-                      style={{ color: color.textDim }}
-                    />
-                  </button>
-                </div>
-                <button
-                  type="button"
-                  onClick={mergeData}
-                  className="flex items-center gap-1.5 rounded-lg border px-3 py-2 text-sm font-medium transition-colors"
-                  style={{
-                    backgroundColor: color.greenSoft,
-                    borderColor: color.greenSoft,
-                    color: color.green,
-                  }}
-                >
-                  Merge Data
-                </button>
-              </div>
-              {importStatus && (
-                <span
-                  className="text-xs"
-                  style={{
-                    color: importStatus.startsWith("Error")
-                      ? color.warning
-                      : color.green,
-                  }}
-                >
-                  {importStatus}
-                </span>
-              )}
-            </div>
+          {importMessage && (
+            <span
+              className="text-xs"
+              style={{
+                color: importMessage.startsWith("Error")
+                  ? color.warning
+                  : color.green,
+              }}
+            >
+              {importMessage}
+            </span>
           )}
         </div>
       </div>
@@ -665,7 +848,7 @@ export function DataPage({
                   className="py-10 text-center text-sm"
                   style={{ color: color.textDim, backgroundColor: color.card }}
                 >
-                  No data available for this drone.
+                  No data available for this mission and drone filter.
                 </td>
               </tr>
             ) : (
@@ -807,6 +990,23 @@ export function DataPage({
         </div>
       )}
     </div>
+
+    {csvModalFile && (
+      <CSVImportModal
+        file={csvModalFile}
+        devices={devices}
+        sensorsMode={sensorsMode}
+        preferredDroneId={selectedDeviceId}
+        onClose={() => setCsvModalFile(null)}
+        onComplete={(msg) => {
+          setImportMessage(msg);
+          onImportComplete?.();
+          void loadMissions();
+          window.setTimeout(() => setImportMessage(null), 4000);
+        }}
+      />
+    )}
+    </>
   );
 }
 

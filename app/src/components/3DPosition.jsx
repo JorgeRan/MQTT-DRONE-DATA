@@ -28,6 +28,34 @@ export function Position({ traceDataset, lowerLimit = 0, upperLimit = 5, selecte
     () => Math.max(0, ...traceDataset.features.map((feature) => feature.properties.methane)),
     [traceDataset],
   )
+  const traceMetricMeta = useMemo(() => {
+    const sensorModes = Array.from(
+      new Set(
+        (traceDataset.features || [])
+          .map((feature) => feature?.properties?.sensorMode)
+          .filter(Boolean),
+      ),
+    )
+
+    if (sensorModes.length === 1 && sensorModes[0] === 'aeris') {
+      return {
+        label: 'methane detections extruded',
+        unit: 'ppm',
+      }
+    }
+
+    if (sensorModes.length === 1 && sensorModes[0] === 'dual') {
+      return {
+        label: 'purway detections extruded',
+        unit: 'ppm-m',
+      }
+    }
+
+    return {
+      label: 'trace detections extruded',
+      unit: 'mixed units',
+    }
+  }, [traceDataset])
   const selectedFocusCoordinates = useMemo(() => {
     const [liveLng, liveLat] = Array.isArray(focusCoordinates) ? focusCoordinates : []
     if (Number.isFinite(liveLat) && Number.isFinite(liveLng)) {
@@ -249,7 +277,7 @@ export function Position({ traceDataset, lowerLimit = 0, upperLimit = 5, selecte
             </div>
             <div className='mt-1 flex items-baseline gap-2'>
               <span className='text-lg font-semibold' style={{ color: color.orange }}>{methanePositiveCount}</span>
-              <span className='text-sm' style={{ color: color.textMuted }}>methane detections extruded</span>
+              <span className='text-sm' style={{ color: color.textMuted }}>{traceMetricMeta.label}</span>
             </div>
           </div>
 
@@ -259,7 +287,7 @@ export function Position({ traceDataset, lowerLimit = 0, upperLimit = 5, selecte
             </div>
             <div className='mt-1 flex items-baseline gap-2'>
               <span className='text-lg font-semibold' style={{ color: color.green }}>{methanePeakValue.toFixed(2)}</span>
-              <span className='text-sm' style={{ color: color.textMuted }}>ppm equivalent</span>
+              <span className='text-sm' style={{ color: color.textMuted }}>{traceMetricMeta.unit}</span>
             </div>
           </div>
         </div>

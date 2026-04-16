@@ -14,7 +14,7 @@ import { color } from "../constants/tailwind";
 
 const seriesTheme = {
   purway: {
-    label: "ppm",
+    label: "ppm-m",
     valueLabel: "Purway",
     stroke: color.orange,
     fill: "rgba(253, 148, 86, 0.26)",

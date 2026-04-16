@@ -50,18 +50,21 @@ export function buildMethaneColorExpression(lowerLimit, upperLimit, propertyName
 
 export function buildHeatmapColorExpression(lowerLimit, upperLimit) {
     const span = Math.max(upperLimit - lowerLimit, minimumLegendSpan)
-    const densityStops = methanePalette.flatMap((_, index) => {
-        const densityValue = 0.14 + (0.86 * index) / (methanePalette.length - 1)
-        const methaneValue = lowerLimit + span * (index / (methanePalette.length - 1))
-        return [densityValue, getScaledMethaneColor(methaneValue, lowerLimit, upperLimit)]
-    })
+    const colorAt = (ratio) => getScaledMethaneColor(lowerLimit + span * ratio, lowerLimit, upperLimit)
 
     return [
         'interpolate',
         ['linear'],
         ['heatmap-density'],
-        0, 'rgba(56, 189, 248, 0)',
-        ...densityStops,
+        0, 'rgba(29, 78, 216, 0)',
+        0.06, colorAt(0.07),
+        0.16, colorAt(0.18),
+        0.32, colorAt(0.34),
+        0.52, colorAt(0.52),
+        0.72, colorAt(0.68),
+        0.88, colorAt(0.84),
+        0.96, colorAt(0.94),
+        1, colorAt(1),
     ]
 }
 
@@ -72,9 +75,12 @@ export function buildHeatmapWeightExpression(lowerLimit, upperLimit) {
         'interpolate',
         ['linear'],
         ['get', 'methane'],
-        lowerLimit, 0.08,
-        lowerLimit + span * 0.25, 0.28,
-        lowerLimit + span * 0.55, 0.58,
+        lowerLimit, 0,
+        lowerLimit + span * 0.08, 0,
+        lowerLimit + span * 0.2, 0.16,
+        lowerLimit + span * 0.45, 0.44,
+        lowerLimit + span * 0.68, 0.74,
+        lowerLimit + span * 0.85, 0.92,
         upperLimit, 1,
     ]
 }
@@ -90,6 +96,20 @@ export function buildHotspotRadiusExpression(lowerLimit, upperLimit) {
         lowerLimit + span * 0.3, 3.6,
         lowerLimit + span * 0.65, 5,
         upperLimit, 6.5,
+    ]
+}
+
+export function buildHotspotHaloRadiusExpression(lowerLimit, upperLimit) {
+    const span = Math.max(upperLimit - lowerLimit, minimumLegendSpan)
+
+    return [
+        'interpolate',
+        ['linear'],
+        ['get', 'methane'],
+        lowerLimit, 7,
+        lowerLimit + span * 0.3, 9.5,
+        lowerLimit + span * 0.65, 13,
+        upperLimit, 16,
     ]
 }
 

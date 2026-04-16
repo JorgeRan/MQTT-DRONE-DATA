@@ -1,0 +1,104 @@
+Date : 2026-04-10 11:31:45
+Directory : /Users/jorgerangel/Documents/dev/Electron-Drone-Data
+Total : 52 files,  28248 codes, 78 comments, 1052 blanks, all 29378 lines
+
+Languages
++----------------+------------+------------+------------+------------+------------+
+| language       | files      | code       | comment    | blank      | total      |
++----------------+------------+------------+------------+------------+------------+
+| JSON           |          8 |     19,163 |          0 |          8 |     19,171 |
+| JavaScript JSX |         12 |      5,066 |         53 |        466 |      5,585 |
+| JavaScript     |         18 |      2,271 |          4 |        443 |      2,718 |
+| CSV            |          1 |        613 |          0 |          1 |        614 |
+| Database       |          1 |        506 |          0 |          4 |        510 |
+| Python         |          3 |        268 |         21 |         60 |        349 |
+| PostCSS        |          2 |        260 |          0 |         45 |        305 |
+| YAML           |          1 |         59 |          0 |         14 |         73 |
+| XML            |          4 |         20 |          0 |          2 |         22 |
+| HTML           |          1 |         13 |          0 |          1 |         14 |
+| Markdown       |          1 |          9 |          0 |          8 |         17 |
++----------------+------------+------------+------------+------------+------------+
+
+Directories
++-------------------------------------------------------------------------------------------------+------------+------------+------------+------------+------------+
+| path                                                                                            | files      | code       | comment    | blank      | total      |
++-------------------------------------------------------------------------------------------------+------------+------------+------------+------------+------------+
+| .                                                                                               |         52 |     28,248 |         78 |      1,052 |     29,378 |
+| . (Files)                                                                                       |          2 |      9,337 |          0 |          2 |      9,339 |
+| .github                                                                                         |          1 |         59 |          0 |         14 |         73 |
+| .github/workflows                                                                               |          1 |         59 |          0 |         14 |         73 |
+| app                                                                                             |         29 |     12,713 |         55 |        622 |     13,390 |
+| app (Files)                                                                                     |          6 |      6,845 |          1 |         17 |      6,863 |
+| app/public                                                                                      |          2 |         10 |          0 |          1 |         11 |
+| app/src                                                                                         |         21 |      5,858 |         54 |        604 |      6,516 |
+| app/src (Files)                                                                                 |          4 |      1,323 |          1 |        160 |      1,484 |
+| app/src/assets                                                                                  |          2 |         10 |          0 |          1 |         11 |
+| app/src/components                                                                              |         10 |      4,003 |         52 |        351 |      4,406 |
+| app/src/constants                                                                               |          3 |        221 |          0 |         36 |        257 |
+| app/src/data                                                                                    |          1 |        183 |          1 |         28 |        212 |
+| app/src/services                                                                                |          1 |        118 |          0 |         28 |        146 |
+| backend                                                                                         |         10 |      4,098 |         18 |        304 |      4,420 |
+| build                                                                                           |          1 |          6 |          3 |          4 |         13 |
+| data                                                                                            |          2 |      1,119 |          0 |          5 |      1,124 |
+| electron                                                                                        |          2 |        138 |          2 |         34 |        174 |
+| mqtt-bridge                                                                                     |          5 |        778 |          0 |         67 |        845 |
++-------------------------------------------------------------------------------------------------+------------+------------+------------+------------+------------+
+
+Files
++-------------------------------------------------------------------------------------------------+----------------+------------+------------+------------+------------+
+| filename                                                                                        | language       | code       | comment    | blank      | total      |
++-------------------------------------------------------------------------------------------------+----------------+------------+------------+------------+------------+
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/.github/workflows/release.yml              | YAML           |         59 |          0 |         14 |         73 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/app/README.md                              | Markdown       |          9 |          0 |          8 |         17 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/app/eslint.config.js                       | JavaScript     |         28 |          0 |          2 |         30 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/app/index.html                             | HTML           |         13 |          0 |          1 |         14 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/app/package-lock.json                      | JSON           |      6,734 |          0 |          1 |      6,735 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/app/package.json                           | JSON           |         42 |          0 |          1 |         43 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/app/public/EERL_logo_black.svg             | XML            |          9 |          0 |          1 |         10 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/app/public/vite.svg                        | XML            |          1 |          0 |          0 |          1 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/app/src/App.css                            | PostCSS        |        259 |          0 |         44 |        303 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/app/src/App.jsx                            | JavaScript JSX |      1,053 |          1 |        113 |      1,167 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/app/src/assets/EERL_logo_black.svg         | XML            |          9 |          0 |          1 |         10 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/app/src/assets/react.svg                   | XML            |          1 |          0 |          0 |          1 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/app/src/components/3DPosition.jsx          | JavaScript JSX |        235 |          5 |         36 |        276 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/app/src/components/DataPage.jsx            | JavaScript JSX |        782 |          1 |         31 |        814 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/app/src/components/FlowChart.jsx           | JavaScript JSX |        634 |          0 |         46 |        680 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/app/src/components/Map.jsx                 | JavaScript JSX |        950 |          0 |        118 |      1,068 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/app/src/components/MeasurementControls.jsx | JavaScript JSX |        118 |          0 |         10 |        128 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/app/src/components/MethanePanel.jsx        | JavaScript JSX |         17 |          0 |          3 |         20 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/app/src/components/MissionModal.jsx        | JavaScript JSX |         70 |          0 |          6 |         76 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/app/src/components/ResultsPage.jsx         | JavaScript JSX |        982 |         35 |         77 |      1,094 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/app/src/components/Tabs.jsx                | JavaScript JSX |         98 |          0 |         11 |        109 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/app/src/components/WindPanel.jsx           | JavaScript JSX |        117 |         11 |         13 |        141 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/app/src/constants/methaneScale.js          | JavaScript     |        116 |          0 |         22 |        138 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/app/src/constants/offlineMap.js            | JavaScript     |         64 |          0 |         12 |         76 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/app/src/constants/tailwind.js              | JavaScript     |         41 |          0 |          2 |         43 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/app/src/data/methaneTraceData.js           | JavaScript     |        183 |          1 |         28 |        212 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/app/src/index.css                          | PostCSS        |          1 |          0 |          1 |          2 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/app/src/main.jsx                           | JavaScript JSX |         10 |          0 |          2 |         12 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/app/src/services/api.js                    | JavaScript     |        118 |          0 |         28 |        146 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/app/vite.config.js                         | JavaScript     |         19 |          1 |          4 |         24 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/backend/MQTT-broker.js                     | JavaScript     |        789 |          0 |        137 |        926 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/backend/SQL.js                             | JavaScript     |         29 |          0 |          8 |         37 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/backend/UDP-broker.js                      | JavaScript     |         13 |          0 |          5 |         18 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/backend/analysis.py                        | Python         |         63 |          0 |         11 |         74 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/backend/analysis_2.py                      | Python         |        199 |         18 |         45 |        262 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/backend/db.js                              | JavaScript     |         90 |          0 |         29 |        119 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/backend/package-lock.json                  | JSON           |      2,494 |          0 |          1 |      2,495 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/backend/package.json                       | JSON           |         18 |          0 |          1 |         19 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/backend/remoteTelemetryStore.js            | JavaScript     |        292 |          0 |         43 |        335 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/backend/simulate-telemetry.js              | JavaScript     |        111 |          0 |         24 |        135 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/build/create_icon.py                       | Python         |          6 |          3 |          4 |         13 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/data/methane20260310005557.csv             | CSV            |        613 |          0 |          1 |        614 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/data/telemetry_events.db                   | Database       |        506 |          0 |          4 |        510 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/electron/main.cjs                          | JavaScript     |        136 |          1 |         32 |        169 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/electron/preload.cjs                       | JavaScript     |          2 |          1 |          2 |          5 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/mqtt-bridge/UDP-broker.js                  | JavaScript     |         13 |          0 |          7 |         20 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/mqtt-bridge/bridge_to_hivemq_cloud.mjs     | JavaScript     |        119 |          0 |         30 |        149 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/mqtt-bridge/bridge_to_hivemq_cloud_2.mjs   | JavaScript     |        108 |          0 |         28 |        136 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/mqtt-bridge/package-lock.json              | JSON           |        533 |          0 |          1 |        534 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/mqtt-bridge/package.json                   | JSON           |          5 |          0 |          1 |          6 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/package-lock.json                          | JSON           |      9,245 |          0 |          1 |      9,246 |
+| /Users/jorgerangel/Documents/dev/Electron-Drone-Data/package.json                               | JSON           |         92 |          0 |          1 |         93 |
+| Total                                                                                           |                |     28,248 |         78 |      1,052 |     29,378 |
++-------------------------------------------------------------------------------------------------+----------------+------------+------------+------------+------------+

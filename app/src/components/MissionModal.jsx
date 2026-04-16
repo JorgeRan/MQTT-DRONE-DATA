@@ -1,7 +1,7 @@
 import React, { useEffect } from 'react';
 import { color } from "../constants/tailwind";
 
-export function MissionModal({ children, onClose }) {
+export function MissionModal({ children, onClose, size = 'default' }) {
   useEffect(() => {
     const handleEscape = (event) => {
       if (event.key === 'Escape') {
@@ -16,7 +16,10 @@ export function MissionModal({ children, onClose }) {
   return (
     <div style={styles.overlay} onMouseDown={onClose}>
       <div
-        style={styles.modal}
+        style={{
+          ...styles.modal,
+          ...(size === 'wide' ? styles.modalWide : null),
+        }}
         onMouseDown={(event) => event.stopPropagation()}
         role="dialog"
         aria-modal="true"
@@ -53,9 +56,15 @@ const styles = {
     position: 'relative',
     width: '100%',
     maxWidth: '620px',
+    maxHeight: 'calc(100vh - 40px)',
     border: `1px solid ${color.borderStrong}`,
     zIndex: 10000,
-    boxShadow: '0 24px 80px rgba(0, 0, 0, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.08)'
+    boxShadow: '0 24px 80px rgba(0, 0, 0, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.08)',
+    overflow: 'hidden',
+  },
+  modalWide: {
+    maxWidth: 'min(1440px, calc(100vw - 32px))',
+    minHeight: 'min(920px, calc(100vh - 40px))',
   },
   closeButton: {
     position: 'absolute',
