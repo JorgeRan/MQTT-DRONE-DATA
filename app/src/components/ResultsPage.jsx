@@ -1,17 +1,25 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { color } from "../constants/tailwind";
 import {
+  calculateDistanceMeters,
+  filterCoordinateOutliers,
   extractTelemetryMetrics,
   getTelemetryPeakValue,
   inferFlowSensorMode,
   SENSOR_MODE_AERIS,
+  SENSOR_MODE_DUAL,
   SENSOR_MODE_MIXED,
   toFiniteNumber,
 } from "../constants/telemetryMetrics";
 import { Map } from "./Map";
 import { MethanePanel } from "./MethanePanel";
 import { filterTraceDatasetBySelection } from "../data/methaneTraceData";
-import { deleteMission, listMissions, runAerisAnalysis } from "../services/api";
+import {
+  deleteMission,
+  listMissions,
+  listTelemetryHistory,
+  runAerisAnalysis,
+} from "../services/api";
 import {
   SquarePen,
   Trash,
@@ -26,7 +34,15 @@ import { MissionModal } from "./MissionModal";
 import { CSVImportModal } from "./CSVModal";
 
 const ALL_DRONES_OPTION = "ALL";
+const ALL_DATA_MISSION_ID = "ALL_DATA_MISSION";
 const REPLAY_STEP_MS = 180;
+const METHANE_MOLAR_MASS_KG_PER_MOL = 0.01604;
+const UNIVERSAL_GAS_CONSTANT = 8.314462618;
+const DEFAULT_BACKGROUND_PPM = 1.9;
+const DEFAULT_TEMPERATURE_K = 293.15;
+const DEFAULT_PRESSURE_PA = 101325.0;
+const DEFAULT_TRANSECT_WIDTH_M = 80.0;
+const DEFAULT_MIXING_HEIGHT_M = 25.0;
 
 const sensorModePresentation = (sensorMode) => {
   if (sensorMode === SENSOR_MODE_AERIS) {
@@ -64,9 +80,23 @@ const formatCompactValue = (value, digits = 2) => {
   });
 };
 
+const formatDateTimeLocalValue = (value) => {
+  if (!value) {
+    return "";
+  }
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+
+  const offsetMs = date.getTimezoneOffset() * 60 * 1000;
+  return new Date(date.getTime() - offsetMs).toISOString().slice(0, 16);
+};
+
 const buildTraceDatasetFromFlowData = (datasetFlowData) => ({
   type: "FeatureCollection",
-  features: datasetFlowData
+  features: filterCoordinateOutliers(datasetFlowData)
     .filter(
       (point) =>
         Number.isFinite(point.latitude) && Number.isFinite(point.longitude),
@@ -106,6 +136,242 @@ const buildTraceDatasetFromFlowData = (datasetFlowData) => ({
       };
     }),
 });
+const ppmToKgM3 = (
+  methanePpm,
+  temperatureK = DEFAULT_TEMPERATURE_K,
+  pressurePa = DEFAULT_PRESSURE_PA,
+) => {
+  if (!Number.isFinite(methanePpm) || methanePpm <= 0) {
+    return 0;
+  }
+
+  const moleFraction = methanePpm * 1e-6;
+  const methaneMolesPerM3 =
+    moleFraction * (pressurePa / (UNIVERSAL_GAS_CONSTANT * temperatureK));
+
+  return methaneMolesPerM3 * METHANE_MOLAR_MASS_KG_PER_MOL;
+};
+
+const quantile = (values, ratio) => {
+  if (!values.length) {
+    return null;
+  }
+
+  const sortedValues = [...values].sort((left, right) => left - right);
+  const boundedRatio = Math.min(1, Math.max(0, ratio));
+  const index = Math.floor((sortedValues.length - 1) * boundedRatio);
+  return sortedValues[index];
+};
+
+const estimateTransectWidthMeters = (flowData) => {
+  const geoPoints = flowData.filter(
+    (point) =>
+      Number.isFinite(point.latitude) && Number.isFinite(point.longitude),
+  );
+
+  if (geoPoints.length < 2) {
+    return DEFAULT_TRANSECT_WIDTH_M;
+  }
+
+  const firstPoint = geoPoints[0];
+  const lastPoint = geoPoints[geoPoints.length - 1];
+  const latitudes = geoPoints.map((point) => point.latitude);
+  const longitudes = geoPoints.map((point) => point.longitude);
+  const minLatitude = Math.min(...latitudes);
+  const maxLatitude = Math.max(...latitudes);
+  const minLongitude = Math.min(...longitudes);
+  const maxLongitude = Math.max(...longitudes);
+
+  const endpointSpan = calculateDistanceMeters(
+    firstPoint.latitude,
+    firstPoint.longitude,
+    lastPoint.latitude,
+    lastPoint.longitude,
+  );
+  const boundingSpan = calculateDistanceMeters(
+    minLatitude,
+    minLongitude,
+    maxLatitude,
+    maxLongitude,
+  );
+
+  return Math.max(DEFAULT_TRANSECT_WIDTH_M, endpointSpan, boundingSpan);
+};
+
+const estimateMixingHeightMeters = (flowData) => {
+  const altitudes = flowData
+    .map((point) => toFiniteNumber(point.altitude))
+    .filter((value) => value !== null);
+
+  if (altitudes.length < 2) {
+    return DEFAULT_MIXING_HEIGHT_M;
+  }
+
+  return Math.max(
+    DEFAULT_MIXING_HEIGHT_M,
+    Math.max(...altitudes) - Math.min(...altitudes),
+  );
+};
+
+const getWindNormalSpeed = (point) => {
+  const windU = toFiniteNumber(point.wind_u);
+  const windV = toFiniteNumber(point.wind_v);
+
+  if (windU !== null || windV !== null) {
+    return Math.hypot(windU ?? 0, windV ?? 0);
+  }
+
+  return Math.max(
+    0,
+    toFiniteNumber(point.speed) ??
+      toFiniteNumber(point.payload?.speed) ??
+      toFiniteNumber(point.payload?.spd) ??
+      0,
+  );
+};
+
+const getPurwayPathLengthMeters = (point) => {
+  const directDistance =
+    toFiniteNumber(point.distance) ?? toFiniteNumber(point.payload?.distance);
+  if (directDistance !== null && directDistance > 0) {
+    return directDistance;
+  }
+
+  const latitude = toFiniteNumber(point.latitude);
+  const longitude = toFiniteNumber(point.longitude);
+  const targetLatitude =
+    toFiniteNumber(point.target_latitude) ??
+    toFiniteNumber(point.payload?.target_latitude) ??
+    toFiniteNumber(point.payload?.target_position?.latitude);
+  const targetLongitude =
+    toFiniteNumber(point.target_longitude) ??
+    toFiniteNumber(point.payload?.target_longitude) ??
+    toFiniteNumber(point.payload?.target_position?.longitude);
+
+  if (
+    latitude === null ||
+    longitude === null ||
+    targetLatitude === null ||
+    targetLongitude === null
+  ) {
+    return null;
+  }
+
+  const horizontalDistance = calculateDistanceMeters(
+    latitude,
+    longitude,
+    targetLatitude,
+    targetLongitude,
+  );
+  if (!Number.isFinite(horizontalDistance) || horizontalDistance <= 0) {
+    return null;
+  }
+
+  const altitude = toFiniteNumber(point.altitude) ?? 0;
+  const targetAltitude =
+    toFiniteNumber(point.target_altitude) ??
+    toFiniteNumber(point.payload?.target_altitude) ??
+    altitude;
+  const verticalDistance = targetAltitude - altitude;
+
+  return Math.hypot(horizontalDistance, verticalDistance);
+};
+
+const getAnalysisMethanePpm = (point) => {
+  if (point?.sensorMode === SENSOR_MODE_AERIS) {
+    return Math.max(0, Number(point.methane ?? 0));
+  }
+
+  const purway = toFiniteNumber(point.purway);
+  const pathLengthMeters = getPurwayPathLengthMeters(point);
+  if (purway !== null && pathLengthMeters !== null && pathLengthMeters > 0) {
+    return Math.max(0, purway / pathLengthMeters);
+  }
+
+  if (purway !== null) {
+    return null;
+  }
+
+  const sniffer = toFiniteNumber(point.sniffer);
+  if (sniffer !== null) {
+    return Math.max(0, sniffer);
+  }
+
+  return Math.max(0, Number(point.methane ?? 0));
+};
+
+const estimateMassFlux = ({
+  flowData,
+  backgroundPpm,
+  transectWidthM,
+  mixingHeightM,
+}) => {
+  const count = flowData.length;
+
+  if (!count || transectWidthM <= 0 || mixingHeightM <= 0) {
+    return {
+      massFluxKgS: 0,
+      massFluxKgH: 0,
+      sampleCount: count,
+      surfaceAreaM2: Math.max(0, transectWidthM * mixingHeightM),
+    };
+  }
+
+  const areaTotal = transectWidthM * mixingHeightM;
+  const areaPerSample = areaTotal / count;
+  const massFluxKgS = flowData.reduce((sum, point) => {
+    const methane = getAnalysisMethanePpm(point);
+    const enhancementPpm = Math.max(0, methane - backgroundPpm);
+    const enhancementKgM3 = ppmToKgM3(enhancementPpm);
+    const windNormal = Math.max(0, getWindNormalSpeed(point));
+    return sum + enhancementKgM3 * windNormal * areaPerSample;
+  }, 0);
+
+  return {
+    massFluxKgS,
+    massFluxKgH: massFluxKgS * 3600,
+    sampleCount: count,
+    surfaceAreaM2: areaTotal,
+  };
+};
+
+const estimateEmissionRate = ({
+  flowData,
+  backgroundPpm,
+  transectWidthM,
+  mixingHeightM,
+}) => {
+  const count = flowData.length;
+
+  if (!count || transectWidthM <= 0 || mixingHeightM <= 0) {
+    return {
+      emissionRateKgS: 0,
+      emissionRateKgH: 0,
+      sampleCount: count,
+      surfaceAreaM2: Math.max(0, transectWidthM * mixingHeightM),
+    };
+  }
+
+  const enhancementsKgM3 = flowData.map((point) => {
+    const methane = getAnalysisMethanePpm(point);
+    return ppmToKgM3(Math.max(0, methane - backgroundPpm));
+  });
+  const windNormals = flowData.map((point) => Math.max(0, getWindNormalSpeed(point)));
+  const meanEnhancementKgM3 =
+    enhancementsKgM3.reduce((sum, value) => sum + value, 0) / count;
+  const meanWindNormal =
+    windNormals.reduce((sum, value) => sum + value, 0) / count;
+  const surfaceAreaM2 = transectWidthM * mixingHeightM;
+  const emissionRateKgS =
+    meanEnhancementKgM3 * meanWindNormal * surfaceAreaM2;
+
+  return {
+    emissionRateKgS,
+    emissionRateKgH: emissionRateKgS * 3600,
+    sampleCount: count,
+    surfaceAreaM2,
+  };
+};
 
 const normalizeMissionPoint = (point, index, droneId) => {
   const metrics = extractTelemetryMetrics(point);
@@ -129,8 +395,32 @@ const normalizeMissionPoint = (point, index, droneId) => {
     timestampIso,
     time: new Date(timestampMs).toLocaleTimeString(),
     altitude: toFiniteNumber(point.altitude) ?? 0,
-    latitude: toFiniteNumber(point.latitude) ?? 0,
-    longitude: toFiniteNumber(point.longitude) ?? 0,
+    latitude: toFiniteNumber(point.latitude),
+    longitude: toFiniteNumber(point.longitude),
+    speed:
+      toFiniteNumber(point.speed) ?? toFiniteNumber(point.payload?.speed) ?? null,
+    wind_u:
+      toFiniteNumber(point.wind_u) ?? toFiniteNumber(point.payload?.wind_u) ?? null,
+    wind_v:
+      toFiniteNumber(point.wind_v) ?? toFiniteNumber(point.payload?.wind_v) ?? null,
+    wind_w:
+      toFiniteNumber(point.wind_w) ?? toFiniteNumber(point.payload?.wind_w) ?? null,
+    distance:
+      toFiniteNumber(point.distance) ?? toFiniteNumber(point.payload?.distance) ?? null,
+    target_latitude:
+      toFiniteNumber(point.target_latitude) ??
+      toFiniteNumber(point.payload?.target_latitude) ??
+      toFiniteNumber(point.payload?.target_position?.latitude) ??
+      null,
+    target_longitude:
+      toFiniteNumber(point.target_longitude) ??
+      toFiniteNumber(point.payload?.target_longitude) ??
+      toFiniteNumber(point.payload?.target_position?.longitude) ??
+      null,
+    target_altitude:
+      toFiniteNumber(point.target_altitude) ??
+      toFiniteNumber(point.payload?.target_altitude) ??
+      null,
     sensorMode: metrics.sensorMode,
     sniffer: metrics.sniffer,
     purway: metrics.purway,
@@ -158,12 +448,43 @@ const flattenMissionFlowData = (results) =>
       sampleIndex: index + 1,
     }));
 
-export function ResultsPage({ devices = [], sensorsMode = [], selectedDeviceId, onSelectDevice }) {
+const normalizeTelemetryHistory = (rows) =>
+  (Array.isArray(rows) ? rows : [])
+    .map((point, index) =>
+      normalizeMissionPoint(
+        point,
+        index,
+        point?.drone_id || point?.droneId || "unknown-drone",
+      ),
+    )
+    .sort((a, b) => a.timestampMs - b.timestampMs)
+    .map((point, index) => ({
+      ...point,
+      sampleOrder: index,
+      sampleIndex: index + 1,
+    }));
+
+export function ResultsPage({
+  devices = [],
+  sensorsMode = [],
+  selectedDeviceId,
+  onSelectDevice,
+  onContinueMission,
+  continuingMissionId = null,
+  measurementStatus = "idle",
+}) {
   const [selectedMissionId, setSelectedMissionId] = useState(null);
 
   const [selectedResultDroneId, setSelectedResultDroneId] =
     useState(ALL_DRONES_OPTION);
   const [missionsSample, setMissionsSample] = useState([]);
+  const [telemetryHistorySample, setTelemetryHistorySample] = useState([]);
+  const [telemetryHistoryRange, setTelemetryHistoryRange] = useState({
+    from: "",
+    to: "",
+  });
+  const [isTelemetryHistoryLoading, setIsTelemetryHistoryLoading] =
+    useState(false);
   const [isDeleteMode, setIsDeleteMode] = useState(false);
   const [deletingMissionId, setDeletingMissionId] = useState(null);
   const [legendScale, setLegendScale] = useState({
@@ -178,7 +499,7 @@ export function ResultsPage({ devices = [], sensorsMode = [], selectedDeviceId, 
   const [isAnalyzeModalOpen, setIsAnalyzeModalOpen] = useState(false);
   const [isNotebookRunning, setIsNotebookRunning] = useState(false);
   const [analysisOutputText, setAnalysisOutputText] = useState("");
-  const [analysisImageDataUri, setAnalysisImageDataUri] = useState("");
+  const [analysisImageDataUris, setAnalysisImageDataUris] = useState([]);
   const [analysisError, setAnalysisError] = useState("");
   const [analysisExecutedAt, setAnalysisExecutedAt] = useState("");
   const [analysisTracerRates, setAnalysisTracerRates] = useState({
@@ -201,7 +522,7 @@ export function ResultsPage({ devices = [], sensorsMode = [], selectedDeviceId, 
     input.click();
   };
 
-  const missions = useMemo(() => {
+  const actualMissions = useMemo(() => {
     return missionsSample
       .map((mission) => {
         const flowData = flattenMissionFlowData(mission.results);
@@ -248,31 +569,97 @@ export function ResultsPage({ devices = [], sensorsMode = [], selectedDeviceId, 
       });
   }, [missionsSample]);
 
-  useEffect(() => {
-    const loadMissions = async () => {
-      const loadedMissions = await listMissions();
-      setMissionsSample(loadedMissions);
-    };
-    void loadMissions();
+  const telemetryHistoryFlowData = useMemo(
+    () => normalizeTelemetryHistory(telemetryHistorySample),
+    [telemetryHistorySample],
+  );
+
+  const loadTelemetryHistory = useCallback(async (range = {}) => {
+    setIsTelemetryHistoryLoading(true);
+    const loadedTelemetryHistory = await listTelemetryHistory({
+      limit: 10000,
+      from: range.from || undefined,
+      to: range.to || undefined,
+    });
+    setTelemetryHistorySample(loadedTelemetryHistory);
+    setIsTelemetryHistoryLoading(false);
   }, []);
 
-  useEffect(() => {
-    if (!missions.length) {
-      setSelectedMissionId(null);
-      return;
-    }
+  const missions = useMemo(() => {
+    const aggregateFlowData = telemetryHistoryFlowData;
+    const aggregateDroneIds = Array.from(
+      new Set(aggregateFlowData.map((point) => point.droneId).filter(Boolean)),
+    );
+    const aggregateStartTs = aggregateFlowData[0]?.timestampIso || null;
+    const aggregateEndTs =
+      aggregateFlowData[aggregateFlowData.length - 1]?.timestampIso || null;
+    const aggregatePeakMethane = aggregateFlowData.reduce(
+      (maxValue, point) => Math.max(maxValue, Number(point.methane || 0)),
+      0,
+    );
+    const aggregateSensorModes = aggregateDroneIds.reduce(
+      (accumulator, droneId) => {
+        const droneFlowData = aggregateFlowData.filter(
+          (point) => point.droneId === droneId,
+        );
+        accumulator[droneId] = inferFlowSensorMode(droneFlowData);
+        return accumulator;
+      },
+      {},
+    );
 
+    return [
+      {
+        id: ALL_DATA_MISSION_ID,
+        name: "All Data",
+        sampleCount: aggregateFlowData.length,
+        droneIds: aggregateDroneIds,
+        primaryDroneId: aggregateDroneIds[0] || null,
+        startTs: aggregateStartTs,
+        endTs: aggregateEndTs,
+        createdAt: null,
+        elapsedSeconds: 0,
+        peakMethane: aggregatePeakMethane,
+        status: aggregateFlowData.length ? "Recorded" : "No Data",
+        droneSensorModeById: aggregateSensorModes,
+        flowData: aggregateFlowData,
+        isSynthetic: true,
+      },
+      ...actualMissions.map((mission) => ({
+        ...mission,
+        isSynthetic: false,
+      })),
+    ];
+  }, [actualMissions, telemetryHistoryFlowData]);
+
+  useEffect(() => {
+    const loadData = async () => {
+      const [loadedMissions] = await Promise.all([listMissions()]);
+      setMissionsSample(loadedMissions);
+      await loadTelemetryHistory({ from: "", to: "" });
+    };
+    void loadData();
+  }, [loadTelemetryHistory]);
+
+  useEffect(() => {
     const selectedMissionStillExists = missions.some(
       (mission) => mission.id === selectedMissionId,
     );
 
     if (!selectedMissionStillExists) {
-      const preferred = missions.find(
-        (mission) => mission.id === selectedDeviceId,
-      );
-      setSelectedMissionId((preferred || missions[0]).id);
+      setSelectedMissionId(ALL_DATA_MISSION_ID);
     }
-  }, [missions, selectedDeviceId, selectedMissionId]);
+  }, [missions, selectedMissionId]);
+
+  const aggregateMission = useMemo(
+    () => missions.find((mission) => mission.id === ALL_DATA_MISSION_ID) || null,
+    [missions],
+  );
+
+  const savedMissions = useMemo(
+    () => missions.filter((mission) => !mission.isSynthetic),
+    [missions],
+  );
 
   const selectedMission = useMemo(
     () => missions.find((mission) => mission.id === selectedMissionId) || null,
@@ -319,6 +706,8 @@ export function ResultsPage({ devices = [], sensorsMode = [], selectedDeviceId, 
     () => inferFlowSensorMode(selectedFlowData),
     [selectedFlowData],
   );
+  const isDualSensorAnalysis = selectedSensorMode === SENSOR_MODE_DUAL;
+  const isAerisAnalysis = selectedSensorMode === SENSOR_MODE_AERIS;
   const hasAerisTraceData = useMemo(
     () =>
       selectedFlowData.some(
@@ -422,24 +811,54 @@ export function ResultsPage({ devices = [], sensorsMode = [], selectedDeviceId, 
         nitrousOxide: Number(point?.nitrousOxide ?? 0),
       }));
   }, [selectedFlowData, selectedWindow]);
+  const aerisTracerAvailability = useMemo(
+    () => ({
+      acetylene: notebookAnalysisSamples.some(
+        (point) => Number.isFinite(point?.acetylene) && Number(point.acetylene) > 0,
+      ),
+      nitrousOxide: notebookAnalysisSamples.some(
+        (point) =>
+          Number.isFinite(point?.nitrousOxide) && Number(point.nitrousOxide) > 0,
+      ),
+    }),
+    [notebookAnalysisSamples],
+  );
+  const selectedAnalysisFlowData = useMemo(() => {
+    if (!selectedFlowData.length) {
+      return [];
+    }
+
+    const safeStart = Math.max(
+      0,
+      Math.min(selectedWindow.startIndex, selectedFlowData.length - 1),
+    );
+    const safeEnd = Math.max(
+      safeStart,
+      Math.min(selectedWindow.endIndex, selectedFlowData.length - 1),
+    );
+
+    return filterCoordinateOutliers(
+      selectedFlowData.slice(safeStart, safeEnd + 1),
+    );
+  }, [selectedFlowData, selectedWindow]);
 
   const averageMethane = useMemo(() => {
-    if (!selectedFlowData.length) {
+    if (!selectedAnalysisFlowData.length) {
       return 0;
     }
 
-    const total = selectedFlowData.reduce(
+    const total = selectedAnalysisFlowData.reduce(
       (sum, point) => sum + Number(point.methane || 0),
       0,
     );
-    return total / selectedFlowData.length;
-  }, [selectedFlowData]);
+    return total / selectedAnalysisFlowData.length;
+  }, [selectedAnalysisFlowData]);
 
   const thresholdSamples = useMemo(
     () =>
-      selectedFlowData.filter((point) => Number(point.methane || 0) >= 2)
+      selectedAnalysisFlowData.filter((point) => Number(point.methane || 0) >= 2)
         .length,
-    [selectedFlowData],
+    [selectedAnalysisFlowData],
   );
 
   const analysisReadiness = useMemo(() => {
@@ -467,32 +886,93 @@ export function ResultsPage({ devices = [], sensorsMode = [], selectedDeviceId, 
   }, [selectedMission, selectedFlowData.length]);
 
   const confidenceScore = useMemo(() => {
-    const sampleCoverage = Math.min(1, selectedFlowData.length / 220);
+    const sampleCoverage = Math.min(1, selectedAnalysisFlowData.length / 220);
     const plumeCoverage = Math.min(1, thresholdSamples / 55);
     const score = Math.round(
       (sampleCoverage * 0.65 + plumeCoverage * 0.35) * 100,
     );
     return Number.isFinite(score) ? Math.max(0, Math.min(100, score)) : 0;
-  }, [selectedFlowData.length, thresholdSamples]);
+  }, [selectedAnalysisFlowData.length, thresholdSamples]);
 
-  const unifiedEmissionRate = useMemo(() => {
-    if (!selectedMission?.flowData?.length) {
-      return 0;
-    }
+  const dualPurwayPathStats = useMemo(() => {
+    const purwaySamples = selectedAnalysisFlowData.filter(
+      (point) => toFiniteNumber(point.purway) !== null,
+    );
+    const samplesWithPathLength = purwaySamples.filter(
+      (point) => (getPurwayPathLengthMeters(point) ?? 0) > 0,
+    );
 
-    const averageFluxProxy =
-      averageMethane * Math.max(1, selectedMission.flowData.length / 80);
-    return Number((averageFluxProxy * 0.032).toFixed(3));
-  }, [averageMethane, selectedMission]);
+    return {
+      purwaySampleCount: purwaySamples.length,
+      pathLengthSampleCount: samplesWithPathLength.length,
+    };
+  }, [selectedAnalysisFlowData]);
+
+  const isDualEstimateBlocked =
+    isDualSensorAnalysis &&
+    dualPurwayPathStats.purwaySampleCount > 0 &&
+    dualPurwayPathStats.pathLengthSampleCount === 0;
+  const isDualEstimatePartial =
+    isDualSensorAnalysis &&
+    dualPurwayPathStats.pathLengthSampleCount > 0 &&
+    dualPurwayPathStats.pathLengthSampleCount <
+      dualPurwayPathStats.purwaySampleCount;
+
+  const fluxEstimates = useMemo(() => {
+    const methaneValues = selectedAnalysisFlowData
+      .map((point) => getAnalysisMethanePpm(point))
+      .filter((value) => Number.isFinite(value));
+    const backgroundPpm =
+      methaneValues.length >= 5
+        ? quantile(methaneValues, 0.1) ?? DEFAULT_BACKGROUND_PPM
+        : DEFAULT_BACKGROUND_PPM;
+    const transectWidthM = estimateTransectWidthMeters(selectedAnalysisFlowData);
+    const mixingHeightM = estimateMixingHeightMeters(selectedAnalysisFlowData);
+    const windSamples = selectedAnalysisFlowData
+      .map((point) => getWindNormalSpeed(point))
+      .filter((value) => Number.isFinite(value) && value > 0);
+    const meanWindNormalMps = windSamples.length
+      ? windSamples.reduce((sum, value) => sum + value, 0) / windSamples.length
+      : 0;
+
+    return {
+      backgroundPpm,
+      transectWidthM,
+      mixingHeightM,
+      meanWindNormalMps,
+      windCoverage:
+        selectedAnalysisFlowData.length > 0
+          ? windSamples.length / selectedAnalysisFlowData.length
+          : 0,
+      massFlux: estimateMassFlux({
+        flowData: selectedAnalysisFlowData,
+        backgroundPpm,
+        transectWidthM,
+        mixingHeightM,
+      }),
+      emissionRate: estimateEmissionRate({
+        flowData: selectedAnalysisFlowData,
+        backgroundPpm,
+        transectWidthM,
+        mixingHeightM,
+      }),
+    };
+  }, [selectedAnalysisFlowData]);
 
   const analysisMethods = useMemo(
     () => [
       {
         name: "Mass Flux Estimation",
-        estimate: `${formatCompactValue(unifiedEmissionRate * 1.08, 3)} kg/h`,
-        uncertainty: "±12%",
-        assumptions: "Wind stable, plume transect complete",
-        quality: confidenceScore >= 70 ? "High" : "Medium",
+        estimate: `${formatCompactValue(fluxEstimates.massFlux.massFluxKgH, 3)} kg/h`,
+        uncertainty:
+          fluxEstimates.windCoverage >= 0.75 ? "±12%" : "±20%",
+        assumptions: `Background ${formatCompactValue(fluxEstimates.backgroundPpm, 2)} ppm, transect ${formatCompactValue(fluxEstimates.transectWidthM, 0)} m, mixing ${formatCompactValue(fluxEstimates.mixingHeightM, 0)} m`,
+        quality:
+          confidenceScore >= 70 && fluxEstimates.windCoverage >= 0.75
+            ? "High"
+            : confidenceScore >= 40
+              ? "Medium"
+              : "Low",
       },
       // {
       //   name: "Control Surface Flux",
@@ -524,10 +1004,16 @@ export function ResultsPage({ devices = [], sensorsMode = [], selectedDeviceId, 
       // },
       {
         name: "Emission Rate Estimation",
-        estimate: `${formatCompactValue(unifiedEmissionRate, 3)} kg/h`,
-        uncertainty: "±14%",
-        assumptions: "Sensor calibration in range",
-        quality: confidenceScore >= 65 ? "High" : "Medium",
+        estimate: `${formatCompactValue(fluxEstimates.emissionRate.emissionRateKgH, 3)} kg/h`,
+        uncertainty:
+          fluxEstimates.windCoverage >= 0.75 ? "±14%" : "±22%",
+        assumptions: `Mean normal wind ${formatCompactValue(fluxEstimates.meanWindNormalMps, 2)} m/s across ${fluxEstimates.emissionRate.sampleCount} samples`,
+        quality:
+          confidenceScore >= 65 && fluxEstimates.windCoverage >= 0.75
+            ? "High"
+            : confidenceScore >= 40
+              ? "Medium"
+              : "Low",
       },
       // {
       //   name: "Mass Balance Method",
@@ -537,7 +1023,7 @@ export function ResultsPage({ devices = [], sensorsMode = [], selectedDeviceId, 
       //   quality: confidenceScore >= 78 ? "Medium" : "Low",
       // },
     ],
-    [confidenceScore, unifiedEmissionRate],
+    [confidenceScore, fluxEstimates],
   );
 
   const missionDurationText = useMemo(() => {
@@ -647,7 +1133,7 @@ export function ResultsPage({ devices = [], sensorsMode = [], selectedDeviceId, 
     setIsNotebookRunning(true);
     setAnalysisError("");
     setAnalysisOutputText("");
-    setAnalysisImageDataUri("");
+    setAnalysisImageDataUris([]);
 
     const nextTracerRates = {
       acetylene:
@@ -657,19 +1143,34 @@ export function ResultsPage({ devices = [], sensorsMode = [], selectedDeviceId, 
     };
     const acetyleneTracerRate = Number.parseFloat(nextTracerRates.acetylene);
     const nitrousOxideTracerRate = Number.parseFloat(nextTracerRates.nitrousOxide);
+    const tracerReleaseRates = {
+      acetylene:
+        aerisTracerAvailability.acetylene &&
+        Number.isFinite(acetyleneTracerRate) &&
+        acetyleneTracerRate > 0
+          ? acetyleneTracerRate
+          : null,
+      nitrousOxide:
+        aerisTracerAvailability.nitrousOxide &&
+        Number.isFinite(nitrousOxideTracerRate) &&
+        nitrousOxideTracerRate > 0
+          ? nitrousOxideTracerRate
+          : null,
+    };
 
     setAnalysisTracerRates(nextTracerRates);
 
+    if (!tracerReleaseRates.acetylene && !tracerReleaseRates.nitrousOxide) {
+      setAnalysisError(
+        "Enter a positive release rate for at least one tracer present in the selected Aeris window.",
+      );
+      setIsNotebookRunning(false);
+      return;
+    }
+
     const result = await runAerisAnalysis({
       samples: notebookAnalysisSamples,
-      tracerReleaseRates: {
-        acetylene: Number.isFinite(acetyleneTracerRate)
-          ? acetyleneTracerRate
-          : null,
-        nitrousOxide: Number.isFinite(nitrousOxideTracerRate)
-          ? nitrousOxideTracerRate
-          : null,
-      },
+      tracerReleaseRates,
       selection: {
         ...selectedWindow,
         sampleCount: notebookAnalysisSamples.length,
@@ -689,7 +1190,13 @@ export function ResultsPage({ devices = [], sensorsMode = [], selectedDeviceId, 
     }
 
     setAnalysisExecutedAt(result.executedAt || new Date().toISOString());
-    setAnalysisImageDataUri(result.imageDataUri || "");
+    setAnalysisImageDataUris(
+      Array.isArray(result.imageDataUris) && result.imageDataUris.length
+        ? result.imageDataUris
+        : result.imageDataUri
+          ? [result.imageDataUri]
+          : [],
+    );
     setAnalysisOutputText(
       result.outputText ||
         "Notebook ran successfully, but returned no output text.",
@@ -698,6 +1205,8 @@ export function ResultsPage({ devices = [], sensorsMode = [], selectedDeviceId, 
   }, [
     analysisTracerRates.acetylene,
     analysisTracerRates.nitrousOxide,
+    aerisTracerAvailability.acetylene,
+    aerisTracerAvailability.nitrousOxide,
     notebookAnalysisSamples,
     selectedMission?.id,
     selectedMission?.name,
@@ -706,22 +1215,25 @@ export function ResultsPage({ devices = [], sensorsMode = [], selectedDeviceId, 
   ]);
 
   const handleDownloadAnalysis = useCallback(() => {
-    if (!analysisImageDataUri && !analysisOutputText) {
+    if (!analysisImageDataUris.length && !analysisOutputText) {
       return;
     }
 
-    const link = document.createElement("a");
     const timestamp = analysisExecutedAt
       ? new Date(analysisExecutedAt).toISOString().replace(/[:.]/g, "-")
       : new Date().toISOString().replace(/[:.]/g, "-");
 
-    if (analysisImageDataUri) {
-      link.href = analysisImageDataUri;
-      link.download = `aeris-analysis-${timestamp}.png`;
-      link.click();
+    if (analysisImageDataUris.length) {
+      analysisImageDataUris.forEach((imageDataUri, index) => {
+        const link = document.createElement("a");
+        link.href = imageDataUri;
+        link.download = `aeris-analysis-${timestamp}-${index + 1}.png`;
+        link.click();
+      });
       return;
     }
 
+    const link = document.createElement("a");
     const blob = new Blob([analysisOutputText], {
       type: "text/plain;charset=utf-8",
     });
@@ -730,13 +1242,13 @@ export function ResultsPage({ devices = [], sensorsMode = [], selectedDeviceId, 
     link.download = `aeris-analysis-${timestamp}.txt`;
     link.click();
     URL.revokeObjectURL(objectUrl);
-  }, [analysisExecutedAt, analysisImageDataUri, analysisOutputText]);
+  }, [analysisExecutedAt, analysisImageDataUris, analysisOutputText]);
 
   return (
     <div className="grid h-full w-full gap-4 p-3 lg:grid-cols-[250px_minmax(0,1fr)]">
       {isAnalyzeModalOpen ? (
         <MissionModal size="wide" onClose={() => setIsAnalyzeModalOpen(false)}>
-          <div className="flex h-full min-h-[78vh] flex-col gap-4">
+          <div className="flex h-full min-h-[78vh] flex-col gap-4 overflow-y-auto pr-2">
             <div className="flex flex-wrap items-start justify-between gap-3 pr-10">
               <div>
                 <p
@@ -760,7 +1272,7 @@ export function ResultsPage({ devices = [], sensorsMode = [], selectedDeviceId, 
                 </p>
               </div>
 
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <button
                   type="button"
                   className="flex items-center gap-2 rounded-md border px-4 py-2 text-sm font-medium disabled:opacity-50"
@@ -770,7 +1282,7 @@ export function ResultsPage({ devices = [], sensorsMode = [], selectedDeviceId, 
                     color: color.text,
                   }}
                   onClick={handleDownloadAnalysis}
-                  disabled={!analysisImageDataUri && !analysisOutputText}
+                  disabled={!analysisImageDataUris.length && !analysisOutputText}
                 >
                   <Download size={16} />
                   Download
@@ -805,16 +1317,32 @@ export function ResultsPage({ devices = [], sensorsMode = [], selectedDeviceId, 
                   >
                     {analysisError}
                   </p>
-                ) : analysisImageDataUri ? (
-                  <img
-                    src={analysisImageDataUri}
-                    alt="Notebook analysis plot"
-                    className="w-full rounded-lg border"
-                    style={{
-                      borderColor: color.borderStrong,
-                      backgroundColor: color.card,
-                    }}
-                  />
+                ) : analysisImageDataUris.length ? (
+                  <div className="flex flex-col gap-4">
+                    {analysisImageDataUris.map((imageDataUri, index) => (
+                      <div key={`${imageDataUri.slice(0, 64)}-${index}`} className="flex flex-col gap-2">
+                        <div className="flex items-center justify-between gap-2">
+                          <h3
+                            className="text-sm font-semibold uppercase tracking-[0.12em]"
+                            style={{ color: color.textDim }}
+                          >
+                            {analysisImageDataUris.length > 1
+                              ? `Figure ${index + 1}`
+                              : "Figure"}
+                          </h3>
+                        </div>
+                        <img
+                          src={imageDataUri}
+                          alt={`Notebook analysis plot ${index + 1}`}
+                          className="w-full rounded-lg border"
+                          style={{
+                            borderColor: color.borderStrong,
+                            backgroundColor: color.card,
+                          }}
+                        />
+                      </div>
+                    ))}
+                  </div>
                 ) : (
                   <p className="text-sm" style={{ color: color.textMuted }}>
                     No figure was returned by the notebook.
@@ -836,7 +1364,7 @@ export function ResultsPage({ devices = [], sensorsMode = [], selectedDeviceId, 
                   >
                     Console Output
                   </h3>
-                  {analysisImageDataUri ? (
+                  {analysisImageDataUris.length ? (
                     <span
                       className="rounded-full px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.12em]"
                       style={{
@@ -844,7 +1372,9 @@ export function ResultsPage({ devices = [], sensorsMode = [], selectedDeviceId, 
                         color: color.green,
                       }}
                     >
-                      Figure Ready
+                      {analysisImageDataUris.length > 1
+                        ? `${analysisImageDataUris.length} Figures Ready`
+                        : "Figure Ready"}
                     </span>
                   ) : null}
                 </div>
@@ -930,7 +1460,7 @@ export function ResultsPage({ devices = [], sensorsMode = [], selectedDeviceId, 
                   color: color.textMuted,
                 }}
               >
-                {missions.length}
+                {actualMissions.length}
               </span>
             </div>
             <button
@@ -947,9 +1477,203 @@ export function ResultsPage({ devices = [], sensorsMode = [], selectedDeviceId, 
           </div>
 
           <div className="space-y-2">
-            {missions.map((mission) => {
+            {aggregateMission ? (() => {
+              const mission = aggregateMission;
+              const isActive = mission.id === selectedMissionId;
+              return (
+                <div
+                  key={mission.id}
+                  className="relative w-full overflow-hidden rounded-md"
+                  style={{ backgroundColor: color.surface }}
+                >
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSelectedMissionId(mission.id);
+                      setSelectedResultDroneId(ALL_DRONES_OPTION);
+                      onSelectDevice?.(
+                        mission.primaryDroneId || selectedDeviceId,
+                      );
+                    }}
+                    className="relative z-10 flex w-full flex-row rounded-md border px-3 py-2 text-left"
+                    style={{
+                      borderColor: isActive ? color.orange : color.border,
+                      backgroundColor: isActive
+                        ? color.orangeSoft
+                        : color.surface,
+                    }}
+                  >
+                    <div>
+                      <div className="flex items-center justify-between gap-2">
+                        <p
+                          className="text-sm font-semibold"
+                          style={{ color: color.text }}
+                        >
+                          {mission.name}
+                        </p>
+                        <span
+                          className="rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em]"
+                          style={{
+                            backgroundColor: color.orangeSoft,
+                            color: color.orange,
+                          }}
+                        >
+                          Permanent
+                        </span>
+                      </div>
+                      <p
+                        className="mt-1 text-xs"
+                        style={{ color: color.textMuted }}
+                      >
+                        {mission.sampleCount} samples across {mission.droneIds.length} drone(s)
+                      </p>
+                      <p
+                        className="mt-1 text-[11px]"
+                        style={{ color: color.textDim }}
+                      >
+                        Combined view across recorded telemetry history
+                      </p>
+                      {aggregateMission?.startTs || aggregateMission?.endTs ? (
+                        <p
+                          className="mt-1 text-[11px]"
+                          style={{ color: color.textDim }}
+                        >
+                          {aggregateMission?.startTs
+                            ? `${formatTimestamp(aggregateMission.startTs)} to ${formatTimestamp(aggregateMission.endTs)}`
+                            : ""}
+                        </p>
+                      ) : null}
+                    </div>
+                  </button>
+                </div>
+              );
+            })() : null}
+
+            <div
+              className="rounded-md border p-3"
+              style={{
+                backgroundColor: color.surface,
+                borderColor: color.border,
+              }}
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <p
+                  className="text-[10px] font-semibold uppercase tracking-[0.16em]"
+                  style={{ color: color.textDim }}
+                >
+                  All Data Range
+                </p>
+                <span
+                  className="text-[11px]"
+                  style={{ color: color.textMuted }}
+                >
+                  {isTelemetryHistoryLoading ? "Loading..." : "Latest 10,000 rows max"}
+                </span>
+              </div>
+              <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                <label className="text-xs" style={{ color: color.textMuted }}>
+                  From
+                  <input
+                    type="datetime-local"
+                    value={telemetryHistoryRange.from}
+                    onChange={(event) => {
+                      const nextFrom = event.target.value;
+                      setTelemetryHistoryRange((previous) => ({
+                        ...previous,
+                        from: nextFrom,
+                      }));
+                    }}
+                    className="mt-1 w-full rounded-md border px-3 py-2 text-sm"
+                    style={{
+                      backgroundColor: color.card,
+                      borderColor: color.borderStrong,
+                      color: color.text,
+                    }}
+                  />
+                </label>
+                <label className="text-xs" style={{ color: color.textMuted }}>
+                  To
+                  <input
+                    type="datetime-local"
+                    value={telemetryHistoryRange.to}
+                    onChange={(event) => {
+                      const nextTo = event.target.value;
+                      setTelemetryHistoryRange((previous) => ({
+                        ...previous,
+                        to: nextTo,
+                      }));
+                    }}
+                    className="mt-1 w-full rounded-md border px-3 py-2 text-sm"
+                    style={{
+                      backgroundColor: color.card,
+                      borderColor: color.borderStrong,
+                      color: color.text,
+                    }}
+                  />
+                </label>
+              </div>
+              <div className="mt-3 flex flex-row gap-2">
+                <button
+                  type="button"
+                  className="rounded-md px-3 py-1.5 text-xs text-nowrap font-semibold"
+                  style={{
+                    backgroundColor: color.orange,
+                    color: "#ffffff",
+                    opacity: isTelemetryHistoryLoading ? 0.6 : 1,
+                  }}
+                  disabled={isTelemetryHistoryLoading}
+                  onClick={() => {
+                    void loadTelemetryHistory(telemetryHistoryRange);
+                  }}
+                >
+                  Apply Range
+                </button>
+                <button
+                  type="button"
+                  className="rounded-md border px-3 py-1.5 text-xs text-nowrap font-semibold"
+                  style={{
+                    backgroundColor: color.card,
+                    borderColor: color.borderStrong,
+                    color: color.text,
+                    opacity: isTelemetryHistoryLoading ? 0.6 : 1,
+                  }}
+                  disabled={isTelemetryHistoryLoading}
+                  onClick={() => {
+                    const emptyRange = { from: "", to: "" };
+                    setTelemetryHistoryRange(emptyRange);
+                    void loadTelemetryHistory(emptyRange);
+                  }}
+                >
+                  Clear Range
+                </button>
+              </div>
+            </div>
+
+            {savedMissions.length ? (
+              <div className="pt-2">
+                <div className="mb-2 flex items-center gap-2">
+                  <div
+                    className="h-px flex-1"
+                    style={{ backgroundColor: color.border }}
+                  />
+                  <span
+                    className="text-[10px] font-semibold uppercase tracking-[0.16em]"
+                    style={{ color: color.textDim }}
+                  >
+                    Saved Missions
+                  </span>
+                  <div
+                    className="h-px flex-1"
+                    style={{ backgroundColor: color.border }}
+                  />
+                </div>
+              </div>
+            ) : null}
+
+            {savedMissions.map((mission) => {
               const isActive = mission.id === selectedMissionId;
               const isDeleting = deletingMissionId === mission.id;
+              const isContinuing = continuingMissionId === mission.id;
               return (
                 <div
                   key={mission.id}
@@ -1025,6 +1749,29 @@ export function ResultsPage({ devices = [], sensorsMode = [], selectedDeviceId, 
                       >
                         {formatTimestamp(mission.endTs)}
                       </p>
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        <button
+                          type="button"
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            onContinueMission?.(mission);
+                          }}
+                          disabled={measurementStatus !== "idle" && !isContinuing}
+                          className="rounded-md px-2.5 py-1 text-[11px] font-semibold"
+                          style={{
+                            backgroundColor: isContinuing
+                              ? color.greenSoft
+                              : color.orangeSoft,
+                            color: isContinuing ? color.green : color.orange,
+                            opacity:
+                              measurementStatus !== "idle" && !isContinuing
+                                ? 0.55
+                                : 1,
+                          }}
+                        >
+                          {isContinuing ? "Continuing" : "Continue"}
+                        </button>
+                      </div>
                     </div>
                   </button>
                   <button
@@ -1032,20 +1779,25 @@ export function ResultsPage({ devices = [], sensorsMode = [], selectedDeviceId, 
                     onClick={() => {
                       void handleDeleteMission(mission.id);
                     }}
-                    disabled={!isDeleteMode || isDeleting}
+                    disabled={!isDeleteMode || isDeleting || mission.isSynthetic}
                     className="absolute right-0 top-0 z-20 flex h-full w-1/3 items-center justify-center transition-transform duration-300 ease-out"
                     style={{
-                      backgroundColor: color.red,
-                      color: "#ffffff",
+                      backgroundColor: mission.isSynthetic ? color.surface : color.red,
+                      color: mission.isSynthetic ? color.textDim : "#ffffff",
                       transform: isDeleteMode
                         ? "translateX(0)"
                         : "translateX(100%)",
                       opacity: isDeleteMode ? 1 : 0,
-                      pointerEvents: isDeleteMode ? "auto" : "none",
+                      pointerEvents:
+                        isDeleteMode && !mission.isSynthetic ? "auto" : "none",
                     }}
-                    aria-label={`Delete mission ${mission.name}`}
+                    aria-label={
+                      mission.isSynthetic
+                        ? `${mission.name} cannot be deleted`
+                        : `Delete mission ${mission.name}`
+                    }
                   >
-                    <Trash size={18} />
+                    {mission.isSynthetic ? "Permanent" : <Trash size={18} />}
                   </button>
                 </div>
               );
@@ -1117,24 +1869,60 @@ export function ResultsPage({ devices = [], sensorsMode = [], selectedDeviceId, 
               >
                 Duration {missionDurationText}
               </span>
-              <button
-                type="button"
-                className="rounded-md px-3 py-1.5 font-semibold"
-                style={{
-                  backgroundColor: color.orange,
-                  color: "#ffffff",
-                }}
-                onClick={() => {
-                  void handleRunNotebookAnalysis();
-                }}
-                disabled={isNotebookRunning}
-              >
-                {isNotebookRunning ? "Running..." : "Run Analysis"}
-              </button>
+              {isAerisAnalysis ? (
+                <button
+                  type="button"
+                  className="rounded-md px-3 py-1.5 font-semibold"
+                  style={{
+                    backgroundColor: color.orange,
+                    color: "#ffffff",
+                  }}
+                  onClick={() => {
+                    void handleRunNotebookAnalysis();
+                  }}
+                  disabled={isNotebookRunning}
+                >
+                  {isNotebookRunning ? "Running..." : "Run Analysis"}
+                </button>
+              ) : isDualSensorAnalysis ? (
+                <div className="flex flex-wrap items-center justify-end gap-2">
+                  <span
+                    className="rounded-md px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.14em]"
+                    style={{
+                      backgroundColor: color.orangeSoft,
+                      color: color.orange,
+                    }}
+                  >
+                    Estimates follow graph timeframe
+                  </span>
+                  {isDualEstimateBlocked ? (
+                    <span
+                      className="rounded-md px-3 py-1.5 text-xs font-semibold"
+                      style={{
+                        backgroundColor: "rgba(239, 68, 68, 0.12)",
+                        color: color.red,
+                      }}
+                    >
+                      Upload CSV with distance to calculate Purway-derived estimates
+                    </span>
+                  ) : isDualEstimatePartial ? (
+                    <span
+                      className="rounded-md px-3 py-1.5 text-xs font-semibold"
+                      style={{
+                        backgroundColor: "rgba(240, 193, 93, 0.16)",
+                        color: color.warning,
+                      }}
+                    >
+                      Some samples are missing distance; estimates use only rows with path length
+                    </span>
+                  ) : null}
+                </div>
+              ) : null}
             </div>
           </div>
         </div>
 
+        {isDualSensorAnalysis ? (
         <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
           <div
             className="rounded-lg border px-3 py-3"
@@ -1150,7 +1938,12 @@ export function ResultsPage({ devices = [], sensorsMode = [], selectedDeviceId, 
               className="mt-1 text-xl font-semibold"
               style={{ color: color.text }}
             >
-              {formatCompactValue(unifiedEmissionRate, 3)} kg/h
+              {isDualEstimateBlocked
+                ? "CSV required"
+                : `${formatCompactValue(
+                    fluxEstimates.emissionRate.emissionRateKgH,
+                    3,
+                  )} kg/h`}
             </p>
           </div>
           <div
@@ -1205,6 +1998,7 @@ export function ResultsPage({ devices = [], sensorsMode = [], selectedDeviceId, 
             </p>
           </div>
         </div>
+        ) : null}
 
         <div className="grid gap-3 xl:grid-cols-[1.35fr_0.65fr] h-full">
           <div
@@ -1453,63 +2247,59 @@ export function ResultsPage({ devices = [], sensorsMode = [], selectedDeviceId, 
           </div>
 
           <div className="grid gap-3 h-full">
-            <div
-              className="min-h-[150px] rounded-lg border p-3"
-              style={{ backgroundColor: color.card, borderColor: color.border }}
-            >
-              {/* <h4
-                className="text-sm font-semibold"
-                style={{ color: color.text }}
+            {isDualSensorAnalysis ? (
+              <div
+                className="min-h-[150px] rounded-lg border p-3"
+                style={{ backgroundColor: color.card, borderColor: color.border }}
               >
-                Method Stack
-              </h4> */}
-              <div className="mt-2 space-y-2">
-                {analysisMethods.slice(0, 4).map((method) => (
-                  <div
-                    key={method.name}
-                    className="rounded-md border px-2.5 py-2"
-                    style={{
-                      backgroundColor: color.surface,
-                      borderColor: color.border,
-                    }}
-                  >
-                    <div className="flex items-center justify-between gap-2">
-                      <p
-                        className="text-xs font-semibold"
-                        style={{ color: color.text }}
-                      >
-                        {method.name}
-                      </p>
-                      <span
-                        className="rounded-full px-2 py-0.5 text-[10px]"
-                        style={{
-                          backgroundColor:
-                            method.quality === "High"
-                              ? color.greenSoft
-                              : method.quality === "Medium"
-                                ? "rgba(240, 193, 93, 0.16)"
-                                : "rgba(239, 68, 68, 0.12)",
-                          color:
-                            method.quality === "High"
-                              ? color.green
-                              : method.quality === "Medium"
-                                ? color.warning
-                                : color.red,
-                        }}
-                      >
-                        {method.quality}
-                      </span>
-                    </div>
-                    <p
-                      className="mt-1 text-[11px]"
-                      style={{ color: color.textMuted }}
+                <div className="mt-2 space-y-2">
+                  {analysisMethods.slice(0, 4).map((method) => (
+                    <div
+                      key={method.name}
+                      className="rounded-md border px-2.5 py-2"
+                      style={{
+                        backgroundColor: color.surface,
+                        borderColor: color.border,
+                      }}
                     >
-                      {method.estimate} • {method.uncertainty}
-                    </p>
-                  </div>
-                ))}
+                      <div className="flex items-center justify-between gap-2">
+                        <p
+                          className="text-xs font-semibold"
+                          style={{ color: color.text }}
+                        >
+                          {method.name}
+                        </p>
+                        <span
+                          className="rounded-full px-2 py-0.5 text-[10px]"
+                          style={{
+                            backgroundColor:
+                              method.quality === "High"
+                                ? color.greenSoft
+                                : method.quality === "Medium"
+                                  ? "rgba(240, 193, 93, 0.16)"
+                                  : "rgba(239, 68, 68, 0.12)",
+                            color:
+                              method.quality === "High"
+                                ? color.green
+                                : method.quality === "Medium"
+                                  ? color.warning
+                                  : color.red,
+                          }}
+                        >
+                          {method.quality}
+                        </span>
+                      </div>
+                      <p
+                        className="mt-1 text-[11px]"
+                        style={{ color: color.textMuted }}
+                      >
+                        {method.estimate} • {method.uncertainty}
+                      </p>
+                    </div>
+                  ))}
+                </div>
               </div>
-            </div>
+            ) : null}
 
             <div
               className="min-h-[280px] rounded-lg border p-3"
@@ -1643,6 +2433,7 @@ export function ResultsPage({ devices = [], sensorsMode = [], selectedDeviceId, 
               onSelectionChange={setSelectedWindow}
               resultsPageMode={true}
               initialTracerRates={analysisTracerRates}
+              tracerAvailability={aerisTracerAvailability}
               onAnalyze={(tracerRates) => {
                 void handleRunNotebookAnalysis(tracerRates);
               }}
@@ -1657,6 +2448,7 @@ export function ResultsPage({ devices = [], sensorsMode = [], selectedDeviceId, 
                   onSelectionChange={setSelectedWindow}
                   resultsPageMode={true}
                   initialTracerRates={analysisTracerRates}
+                  tracerAvailability={aerisTracerAvailability}
                   onAnalyze={(tracerRates) => {
                     void handleRunNotebookAnalysis(tracerRates);
                   }}

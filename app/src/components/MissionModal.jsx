@@ -60,7 +60,8 @@ const styles = {
     border: `1px solid ${color.borderStrong}`,
     zIndex: 10000,
     boxShadow: '0 24px 80px rgba(0, 0, 0, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.08)',
-    overflow: 'hidden',
+    overflowX: 'hidden',
+    overflowY: 'auto',
   },
   modalWide: {
     maxWidth: 'min(1440px, calc(100vw - 32px))',

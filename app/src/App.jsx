@@ -20,6 +20,8 @@ import {
   methaneTraceDataset,
 } from "./data/methaneTraceData";
 import {
+  calculateDistanceMeters,
+  filterCoordinateOutliers,
   extractTelemetryMetrics,
   getTelemetryPeakValue,
   inferFlowSensorMode,
@@ -36,6 +38,7 @@ import {
   saveMission,
   startMeasurement,
   stopMeasurement,
+  updateMission,
   waitForBackendReady,
 } from "./services/api";
 
@@ -96,8 +99,8 @@ const buildFlowDataFromHistory = (historyRows) => {
       acetylene: metrics.acetylene,
       nitrousOxide: metrics.nitrousOxide,
       altitude: toFiniteNumber(row.altitude) ?? 0,
-      latitude: toFiniteNumber(row.latitude) ?? 0,
-      longitude: toFiniteNumber(row.longitude) ?? 0,
+      latitude: toFiniteNumber(row.latitude),
+      longitude: toFiniteNumber(row.longitude),
       wind_u: toFiniteNumber(payload.wind_u) ?? 0,
       wind_v: toFiniteNumber(payload.wind_v) ?? 0,
       wind_w: toFiniteNumber(payload.wind_w) ?? 0,
@@ -128,8 +131,8 @@ const buildFlowPointFromTelemetry = (telemetryRow, sampleOrder) => {
     acetylene: metrics.acetylene,
     nitrousOxide: metrics.nitrousOxide,
     altitude: toFiniteNumber(telemetryRow.altitude) ?? 0,
-    latitude: toFiniteNumber(telemetryRow.latitude) ?? 0,
-    longitude: toFiniteNumber(telemetryRow.longitude) ?? 0,
+    latitude: toFiniteNumber(telemetryRow.latitude),
+    longitude: toFiniteNumber(telemetryRow.longitude),
     wind_u: toFiniteNumber(payload.wind_u) ?? 0,
     wind_v: toFiniteNumber(payload.wind_v) ?? 0,
     wind_w: toFiniteNumber(payload.wind_w) ?? 0,
@@ -140,7 +143,7 @@ const buildFlowPointFromTelemetry = (telemetryRow, sampleOrder) => {
 
 const buildTraceDatasetFromFlowData = (datasetFlowData) => ({
   type: "FeatureCollection",
-  features: datasetFlowData
+  features: filterCoordinateOutliers(datasetFlowData)
     .filter(
       (point) =>
         Number.isFinite(point.latitude) && Number.isFinite(point.longitude),
@@ -203,32 +206,13 @@ const MOVEMENT_THRESHOLD_METERS = 1.5;
 const START_MISSION_PROMPT_COOLDOWN_MS = 45000;
 const START_MISSION_PROMPT_SNOOZE_AFTER_SAVE_MS = 120000;
 
-const toRadians = (degrees) => (degrees * Math.PI) / 180;
-
-const calculateDistanceMeters = (
-  latitudeA,
-  longitudeA,
-  latitudeB,
-  longitudeB,
-) => {
-  const earthRadiusMeters = 6371000;
-  const deltaLatitude = toRadians(latitudeB - latitudeA);
-  const deltaLongitude = toRadians(longitudeB - longitudeA);
-  const a =
-    Math.sin(deltaLatitude / 2) ** 2 +
-    Math.cos(toRadians(latitudeA)) *
-      Math.cos(toRadians(latitudeB)) *
-      Math.sin(deltaLongitude / 2) ** 2;
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return earthRadiusMeters * c;
-};
-
 function App() {
   const [currentView, setCurrentView] = useState("dashboard");
   const [selectedDeviceId, setSelectedDeviceId] = useState(devices[0].id);
   const [measurementStatus, setMeasurementStatus] = useState("idle");
   const [measurementElapsedSeconds, setMeasurementElapsedSeconds] = useState(0);
   const [measurementBusy, setMeasurementBusy] = useState(false);
+  const [continuingMission, setContinuingMission] = useState(null);
   const [recordedFlowDataByDrone, setRecordedFlowDataByDrone] = useState({});
   const [measurementTraceByDrone, setMeasurementTraceByDrone] = useState({});
   const [liveTelemetryByDrone, setLiveTelemetryByDrone] = useState({});
@@ -660,6 +644,7 @@ function App() {
     setMeasurementBusy(true);
     setMeasurementTraceByDrone({});
     setMissionName("");
+    setContinuingMission(null);
     const status = await startMeasurement();
     if (status) {
       setMeasurementStatus(status.status);
@@ -697,6 +682,61 @@ function App() {
     }
     setMeasurementTraceByDrone({});
     setMissionName("");
+    setContinuingMission(null);
+    setMeasurementBusy(false);
+  };
+
+  const handleContinueMission = async (mission) => {
+    if (!mission?.id) {
+      return;
+    }
+
+    if (measurementStatusRef.current !== "idle") {
+      msgs.current?.clear();
+      msgs.current?.show({
+        life: 3500,
+        severity: "warn",
+        summary: "Measurement Active",
+        detail: "Stop the current measurement before continuing another mission.",
+        closable: true,
+      });
+      return;
+    }
+
+    setMeasurementBusy(true);
+    setMeasurementTraceByDrone({});
+    setMissionName(mission.name || "");
+    setContinuingMission({
+      id: mission.id,
+      name: mission.name || "Untitled Mission",
+    });
+
+    const status = await startMeasurement();
+
+    if (status) {
+      setMeasurementStatus(status.status);
+      setMeasurementElapsedSeconds(status.elapsedSeconds);
+      setCurrentView("dashboard");
+      msgs.current?.clear();
+      msgs.current?.show({
+        life: 3000,
+        severity: "success",
+        summary: "Continuing Mission",
+        detail: `Recording resumed into ${mission.name || "Untitled Mission"}.`,
+        closable: true,
+      });
+    } else {
+      setContinuingMission(null);
+      msgs.current?.clear();
+      msgs.current?.show({
+        life: 3500,
+        severity: "error",
+        summary: "Continue Failed",
+        detail: "Could not start measurement to continue this mission.",
+        closable: true,
+      });
+    }
+
     setMeasurementBusy(false);
   };
 
@@ -749,15 +789,21 @@ function App() {
       return;
     }
 
-    const missionPayload = {
-      id: `mission-${Date.now()}`,
-      name: missionName.trim() || `Mission ${new Date().toLocaleString()}`,
-      createdAt: new Date().toISOString(),
-      elapsedSeconds: measurementElapsedSeconds,
-      results: missionResults,
-    };
+    const missionPayload = continuingMission
+      ? {
+          results: missionResults,
+        }
+      : {
+          id: `mission-${Date.now()}`,
+          name: missionName.trim() || `Mission ${new Date().toLocaleString()}`,
+          createdAt: new Date().toISOString(),
+          elapsedSeconds: measurementElapsedSeconds,
+          results: missionResults,
+        };
 
-    const savedMission = await saveMission(missionPayload);
+    const savedMission = continuingMission
+      ? await updateMission(continuingMission.id, missionPayload)
+      : await saveMission(missionPayload);
 
     if (!savedMission) {
       msgs.current?.clear();
@@ -782,8 +828,10 @@ function App() {
     msgs.current?.show({
       life: 3000,
       severity: "success",
-      summary: "Mission Saved",
-      detail: `${savedMission.name} saved with ${savedMission.results.length} drone result(s).`,
+      summary: continuingMission ? "Mission Continued" : "Mission Saved",
+      detail: continuingMission
+        ? `${savedMission.name} updated with additional telemetry.`
+        : `${savedMission.name} saved with ${savedMission.results.length} drone result(s).`,
       closable: true,
     });
 
@@ -792,6 +840,7 @@ function App() {
 
     setMeasurementTraceByDrone({});
     setMissionName("");
+    setContinuingMission(null);
     setMeasurementBusy(false);
   };
 
@@ -959,10 +1008,13 @@ function App() {
         {currentView === "results" ? (
           <ResultsPage
             devices={devices}
-            sensorModes={sensorsMode}
+            sensorsMode={sensorsMode}
             flowDataByDrone={recordedFlowDataByDrone}
             selectedDeviceId={selectedDeviceId}
             onSelectDevice={setSelectedDeviceId}
+            onContinueMission={handleContinueMission}
+            continuingMissionId={continuingMission?.id || null}
+            measurementStatus={measurementStatus}
           />
         ) : currentView === "data" ? (
           <DataPage

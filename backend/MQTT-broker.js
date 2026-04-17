@@ -267,8 +267,12 @@ const outputToImageDataUri = (output) => {
 
 const extractNotebookResult = (notebookJson) => {
   const cells = Array.isArray(notebookJson?.cells) ? notebookJson.cells : [];
+  const textChunks = [];
+  const imageDataUris = [];
+  let cellIndex = null;
+  let executionCount = null;
 
-  for (let index = cells.length - 1; index >= 0; index -= 1) {
+  for (let index = 0; index < cells.length; index += 1) {
     const cell = cells[index];
 
     if (cell?.cell_type !== "code") {
@@ -276,29 +280,47 @@ const extractNotebookResult = (notebookJson) => {
     }
 
     const outputs = Array.isArray(cell.outputs) ? cell.outputs : [];
-    const imageDataUri =
-      outputs.map(outputToImageDataUri).find(Boolean) || null;
     const outputText = outputs
       .map(outputToText)
       .map((text) => text.trim())
       .filter(Boolean)
       .join("\n\n")
       .trim();
+    const nextImageDataUris = outputs.map(outputToImageDataUri).filter(Boolean);
 
-    if (outputText || imageDataUri) {
-      return {
-        outputText,
-        imageDataUri,
-        cellIndex: index,
-        executionCount: Number(cell.execution_count || 0),
-      };
+    if (outputText) {
+      textChunks.push(outputText);
+      cellIndex = index;
+      executionCount = Number(cell.execution_count || 0);
     }
+
+    if (nextImageDataUris.length) {
+      imageDataUris.push(...nextImageDataUris);
+      cellIndex = index;
+      executionCount = Number(cell.execution_count || 0);
+    }
+  }
+
+  const combinedOutputText = textChunks.join("\n\n").trim();
+  const imageDataUri = imageDataUris.length
+    ? imageDataUris[imageDataUris.length - 1]
+    : null;
+
+  if (combinedOutputText || imageDataUri) {
+    return {
+      outputText: combinedOutputText,
+      imageDataUri,
+      imageDataUris,
+      cellIndex,
+      executionCount,
+    };
   }
 
   return {
     outputText:
       "Notebook executed, but no output was captured from code cells.",
     imageDataUri: null,
+    imageDataUris: [],
     cellIndex: null,
     executionCount: null,
   };
@@ -357,9 +379,14 @@ const createNotebookInputPayload = (body = {}) => {
     mission:
       body.mission && typeof body.mission === "object" ? body.mission : null,
     tracerReleaseRates: {
-      acetylene: toFiniteNumber(body?.tracerReleaseRates?.acetylene) ?? 0.5,
-      nitrousOxide:
-        toFiniteNumber(body?.tracerReleaseRates?.nitrousOxide) ?? 0.5,
+      acetylene: (() => {
+        const parsed = toFiniteNumber(body?.tracerReleaseRates?.acetylene);
+        return parsed !== null && parsed > 0 ? parsed : null;
+      })(),
+      nitrousOxide: (() => {
+        const parsed = toFiniteNumber(body?.tracerReleaseRates?.nitrousOxide);
+        return parsed !== null && parsed > 0 ? parsed : null;
+      })(),
     },
     samples,
   };
@@ -1241,6 +1268,7 @@ app.post("/api/aeris/analyze", async (req, res) => {
       ok: true,
       outputText: result.outputText,
       imageDataUri: result.imageDataUri,
+      imageDataUris: result.imageDataUris,
       executionCount: result.executionCount,
       cellIndex: result.cellIndex,
       pythonCommand: result.pythonCommand,
@@ -1564,6 +1592,56 @@ app.get("/api/drones/latest", async (_req, res) => {
   } catch (error) {
     console.error("Latest endpoint error:", error.message);
     res.status(500).json({ error: "Failed to fetch latest drone state" });
+  }
+});
+
+app.get("/api/telemetry/history", async (req, res) => {
+  const fromDate = parseQueryDate(req.query.from);
+  const toDate = parseQueryDate(req.query.to);
+  const limit = Math.min(Number(req.query.limit) || 10000, 50000);
+
+  if ((req.query.from && !fromDate) || (req.query.to && !toDate)) {
+    return res.status(400).json({
+      error: "Invalid date format for from/to. Use ISO date strings.",
+    });
+  }
+
+  if (fromDate && toDate && fromDate > toDate) {
+    return res.status(400).json({ error: "from must be before to" });
+  }
+
+  try {
+    const filters = [];
+    const params = [];
+
+    if (fromDate) {
+      params.push(fromDate);
+      filters.push(`ts >= $${params.length}`);
+    }
+
+    if (toDate) {
+      params.push(toDate);
+      filters.push(`ts <= $${params.length}`);
+    }
+
+    params.push(limit);
+
+    const whereClause = filters.length ? `WHERE ${filters.join(" AND ")}` : "";
+    const result = await sql.unsafe(
+      `
+            SELECT drone_id, topic, ts, latitude, longitude, altitude, target_latitude, target_longitude, methane, sniffer, purway, distance, payload
+            FROM ${TELEMETRY_TABLE}
+            ${whereClause}
+            ORDER BY ts DESC
+            LIMIT $${params.length}
+            `,
+      params,
+    );
+
+    res.json({ data: result.map(hydrateTelemetryRow) });
+  } catch (error) {
+    console.error("Telemetry history endpoint error:", error.message);
+    res.status(500).json({ error: "Failed to fetch telemetry history" });
   }
 });
 

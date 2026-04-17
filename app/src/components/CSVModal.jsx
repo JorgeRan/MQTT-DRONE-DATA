@@ -1,17 +1,77 @@
 import React, { useEffect, useState } from "react";
 import { color } from "../constants/tailwind";
 import { backendHttpUrl } from "../services/api";
-import { SENSOR_MODE_DUAL } from "../constants/telemetryMetrics";
+import {
+  SENSOR_MODE_AERIS,
+  SENSOR_MODE_DUAL,
+} from "../constants/telemetryMetrics";
 
 const parseNumber = (value) => {
   const parsed = Number(String(value ?? "").trim());
   return Number.isFinite(parsed) ? parsed : null;
 };
 
-const parseTimestamp = (rawTime) => {
+const normalizeHeader = (value) =>
+  String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "_");
+
+const detectDelimiter = (headerLine) => {
+  const semicolonCount = (headerLine.match(/;/g) || []).length;
+  const commaCount = (headerLine.match(/,/g) || []).length;
+  return semicolonCount > commaCount ? ";" : ",";
+};
+
+const splitDelimitedLine = (line, delimiter) =>
+  String(line ?? "").split(delimiter).map((value) => value.trim());
+
+const formatDatePart = (date) => {
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(date.getUTCDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+};
+
+const withTimeOnlyTimestamp = (timeValue, baseDateMs, lastTimestampMs) => {
+  const match = String(timeValue ?? "")
+    .trim()
+    .match(/^(\d{1,2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?$/);
+
+  if (!match) {
+    return null;
+  }
+
+  const [, hours, minutes, seconds, fractional = "0"] = match;
+  const milliseconds = String(fractional).padEnd(3, "0").slice(0, 3);
+  const baseDate = new Date(baseDateMs);
+  let timestampIso = `${formatDatePart(baseDate)}T${String(hours).padStart(2, "0")}:${minutes}:${seconds}.${milliseconds}Z`;
+  let timestampMs = new Date(timestampIso).getTime();
+
+  if (!Number.isFinite(timestampMs)) {
+    return null;
+  }
+
+  if (Number.isFinite(lastTimestampMs) && timestampMs < lastTimestampMs) {
+    const rolloverDate = new Date(baseDateMs);
+    rolloverDate.setUTCDate(rolloverDate.getUTCDate() + 1);
+    timestampIso = `${formatDatePart(rolloverDate)}T${String(hours).padStart(2, "0")}:${minutes}:${seconds}.${milliseconds}Z`;
+    timestampMs = new Date(timestampIso).getTime();
+  }
+
+  return { timestampIso, timestampMs };
+};
+
+const parseTimestamp = (rawTime, options = {}) => {
+  const { baseDateMs = Date.now(), lastTimestampMs = null } = options;
   const value = String(rawTime ?? "").trim();
   if (!value) {
     return null;
+  }
+
+  const timeOnly = withTimeOnlyTimestamp(value, baseDateMs, lastTimestampMs);
+  if (timeOnly) {
+    return timeOnly;
   }
 
   const [datePart, timePart] = value.split("_");
@@ -37,21 +97,19 @@ const parseTimestamp = (rawTime) => {
   return { timestampIso, timestampMs };
 };
 
-function parseCsvToMissionResults(text, fallbackDroneId) {
-  const lines = text
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  if (lines.length < 2) return null;
-
-  const headers = lines[0].split(",").map((h) => h.trim());
+const parseStandardCsvToMissionResults = (
+  lines,
+  headers,
+  fallbackDroneId,
+  defaultSensorMode,
+  parseOptions,
+) => {
   const headerMap = new Map(
-    headers.map((name, index) => [name.toLowerCase(), index]),
+    headers.map((name, index) => [normalizeHeader(name), index]),
   );
   const idx = (...names) => {
     for (const name of names) {
-      const match = headerMap.get(name.toLowerCase());
+      const match = headerMap.get(normalizeHeader(name));
       if (match !== undefined) return match;
     }
     return -1;
@@ -69,6 +127,7 @@ function parseCsvToMissionResults(text, fallbackDroneId) {
   const distIdx = idx("distance");
   const targetLatIdx = idx("dest_latitude", "target_latitude");
   const targetLonIdx = idx("dest_longitude", "target_longitude");
+  const speedIdx = idx("speed", "spd", "ground_speed");
   const windUIdx = idx("wind_u", "u_wind", "u");
   const windVIdx = idx("wind_v", "v_wind", "v");
   const windWIdx = idx("wind_w", "w_wind", "w");
@@ -78,11 +137,16 @@ function parseCsvToMissionResults(text, fallbackDroneId) {
   if (timeIdx === -1) return null;
 
   const rowsByDrone = new Map();
+  let previousTimestampMs = null;
 
   for (const line of lines.slice(1)) {
-    const cols = line.split(",");
-    const ts = parseTimestamp(cols[timeIdx]);
+    const cols = splitDelimitedLine(line, detectDelimiter(lines[0]));
+    const ts = parseTimestamp(cols[timeIdx], {
+      ...parseOptions,
+      lastTimestampMs: previousTimestampMs,
+    });
     if (!ts) continue;
+    previousTimestampMs = ts.timestampMs;
 
     const methane =
       methaneIdx !== -1 ? (parseNumber(cols[methaneIdx]) ?? 0) : 0;
@@ -96,8 +160,8 @@ function parseCsvToMissionResults(text, fallbackDroneId) {
         sensorModeIdx !== -1
           ? String(cols[sensorModeIdx] || "")
               .trim()
-              .toLowerCase() || SENSOR_MODE_DUAL
-          : SENSOR_MODE_DUAL,
+              .toLowerCase() || defaultSensorMode
+          : defaultSensorMode,
       methane,
       acetylene: acetyleneIdx !== -1 ? parseNumber(cols[acetyleneIdx]) : null,
       ethylene: ethyleneIdx !== -1 ? parseNumber(cols[ethyleneIdx]) : null,
@@ -107,6 +171,7 @@ function parseCsvToMissionResults(text, fallbackDroneId) {
       longitude: lonIdx !== -1 ? parseNumber(cols[lonIdx]) : null,
       altitude: altIdx !== -1 ? parseNumber(cols[altIdx]) : null,
       distance: distIdx !== -1 ? parseNumber(cols[distIdx]) : null,
+      speed: speedIdx !== -1 ? parseNumber(cols[speedIdx]) : null,
       target_latitude:
         targetLatIdx !== -1 ? parseNumber(cols[targetLatIdx]) : null,
       target_longitude:
@@ -134,6 +199,211 @@ function parseCsvToMissionResults(text, fallbackDroneId) {
     .filter((entry) => entry.data.length > 0);
 
   return missionResults.length > 0 ? missionResults : null;
+};
+
+const findHeaderIndex = (headers, matcher) =>
+  headers.findIndex((header) => matcher(normalizeHeader(header)));
+
+const hasFiniteCoordinates = (state) =>
+  Number.isFinite(state?.latitude) && Number.isFinite(state?.longitude);
+
+const buildAerisSnapshotPoint = (timestamp, sensorMode, state) => {
+  if (!hasFiniteCoordinates(state)) {
+    return null;
+  }
+
+  const point = {
+    timestampIso: timestamp.timestampIso,
+    timestampMs: timestamp.timestampMs,
+    sensorMode,
+    latitude: state.latitude,
+    longitude: state.longitude,
+    payload: {
+      sensorMode,
+    },
+  };
+
+  const optionalFields = {
+    methane: state.methane,
+    acetylene: state.acetylene,
+    nitrousOxide: state.nitrousOxide,
+    altitude: state.altitude,
+    wind_u: state.wind_u,
+    wind_v: state.wind_v,
+    wind_w: state.wind_w,
+  };
+
+  Object.entries(optionalFields).forEach(([key, value]) => {
+    if (value !== null && value !== undefined) {
+      point[key] = value;
+      point.payload[key] = value;
+    }
+  });
+
+  return point;
+};
+
+const hasAerisHeaders = (headers) => {
+  const normalizedHeaders = headers.map(normalizeHeader);
+  return (
+    normalizedHeaders.includes("utctime") &&
+    normalizedHeaders.some(
+      (header) =>
+        header.endsWith(".ch4") ||
+        header.endsWith(".c2h2_ppb") ||
+        header.endsWith(".n2o"),
+    )
+  );
+};
+
+const parseAerisCsvToMissionResults = (
+  lines,
+  headers,
+  fallbackDroneId,
+  defaultSensorMode,
+  parseOptions,
+) => {
+  const delimiter = detectDelimiter(lines[0]);
+  const timeIdx = findHeaderIndex(headers, (header) => header === "utctime");
+  const methaneIdx = findHeaderIndex(headers, (header) => header.endsWith(".ch4"));
+  const acetyleneIdx = findHeaderIndex(headers, (header) =>
+    header.endsWith(".c2h2_ppb"),
+  );
+  const nitrousOxideIdx = findHeaderIndex(headers, (header) =>
+    header.endsWith(".n2o"),
+  );
+  const latitudeIdx = findHeaderIndex(headers, (header) => header.endsWith(".lat"));
+  const longitudeIdx = findHeaderIndex(headers, (header) => header.endsWith(".lon"));
+  const altitudeIdx = findHeaderIndex(headers, (header) => header.endsWith(".alt"));
+  const windUIdx = findHeaderIndex(headers, (header) => header.endsWith(".velx"));
+  const windVIdx = findHeaderIndex(headers, (header) => header.endsWith(".vely"));
+  const windWIdx = findHeaderIndex(headers, (header) => header.endsWith(".velz"));
+
+  if (timeIdx === -1) {
+    return null;
+  }
+
+  const rows = [];
+  const rollingState = {
+    methane: null,
+    acetylene: null,
+    nitrousOxide: null,
+    latitude: null,
+    longitude: null,
+    altitude: null,
+    wind_u: null,
+    wind_v: null,
+    wind_w: null,
+  };
+  let previousTimestampMs = null;
+
+  for (const line of lines.slice(1)) {
+    const cols = splitDelimitedLine(line, delimiter);
+    const ts = parseTimestamp(cols[timeIdx], {
+      ...parseOptions,
+      lastTimestampMs: previousTimestampMs,
+    });
+    if (!ts) {
+      continue;
+    }
+    previousTimestampMs = ts.timestampMs;
+
+    const methane = methaneIdx !== -1 ? parseNumber(cols[methaneIdx]) : null;
+    const acetylenePpb =
+      acetyleneIdx !== -1 ? parseNumber(cols[acetyleneIdx]) : null;
+    const nitrousOxide =
+      nitrousOxideIdx !== -1 ? parseNumber(cols[nitrousOxideIdx]) : null;
+    const latitude = latitudeIdx !== -1 ? parseNumber(cols[latitudeIdx]) : null;
+    const longitude =
+      longitudeIdx !== -1 ? parseNumber(cols[longitudeIdx]) : null;
+    const altitude = altitudeIdx !== -1 ? parseNumber(cols[altitudeIdx]) : null;
+    const windU = windUIdx !== -1 ? parseNumber(cols[windUIdx]) : null;
+    const windV = windVIdx !== -1 ? parseNumber(cols[windVIdx]) : null;
+    const windW = windWIdx !== -1 ? parseNumber(cols[windWIdx]) : null;
+
+    const updates = {
+      methane,
+      acetylene: acetylenePpb !== null ? acetylenePpb / 1000 : null,
+      nitrousOxide,
+      latitude,
+      longitude,
+      altitude,
+      wind_u: windU,
+      wind_v: windV,
+      wind_w: windW,
+    };
+
+    const changedEntries = Object.entries(updates).filter(
+      ([, value]) => value !== null,
+    );
+
+    if (!changedEntries.length) {
+      continue;
+    }
+
+    changedEntries.forEach(([key, value]) => {
+      rollingState[key] = value;
+    });
+
+    const snapshotPoint = buildAerisSnapshotPoint(
+      ts,
+      defaultSensorMode,
+      rollingState,
+    );
+
+    if (snapshotPoint) {
+      rows.push(snapshotPoint);
+    }
+  }
+
+  if (!rows.length) {
+    return null;
+  }
+
+  return [
+    {
+      drone: fallbackDroneId,
+      data: rows,
+    },
+  ];
+};
+
+function parseCsvToMissionResults(text, options) {
+  const { fallbackDroneId, defaultSensorMode, fileLastModified } = options;
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  if (lines.length < 2) return null;
+
+  const delimiter = detectDelimiter(lines[0]);
+  const headers = splitDelimitedLine(lines[0], delimiter);
+  const parseOptions = {
+    baseDateMs: fileLastModified || Date.now(),
+  };
+
+  if (defaultSensorMode === SENSOR_MODE_AERIS || hasAerisHeaders(headers)) {
+    const aerisResults = parseAerisCsvToMissionResults(
+      lines,
+      headers,
+      fallbackDroneId,
+      SENSOR_MODE_AERIS,
+      parseOptions,
+    );
+
+    if (aerisResults) {
+      return aerisResults;
+    }
+  }
+
+  return parseStandardCsvToMissionResults(
+    lines,
+    headers,
+    fallbackDroneId,
+    defaultSensorMode || SENSOR_MODE_DUAL,
+    parseOptions,
+  );
 }
 
 export function CSVImportModal({
@@ -208,7 +478,11 @@ export function CSVImportModal({
         selectedDroneId.trim() ||
         file.name.replace(/\.csv$/i, "").trim() ||
         "csv-import";
-      const results = parseCsvToMissionResults(fileText, fallbackDroneId);
+      const results = parseCsvToMissionResults(fileText, {
+        fallbackDroneId,
+        defaultSensorMode: selectedSensorId || SENSOR_MODE_DUAL,
+        fileLastModified: file.lastModified,
+      });
 
       if (!results) {
         setStatus({
@@ -316,6 +590,10 @@ export function CSVImportModal({
           </p>
           <p style={{ fontSize: 12, color: color.textDim }}>
             How would you like to import this data?
+          </p>
+          <p style={{ fontSize: 12, color: color.textMuted, marginTop: 8 }}>
+            Dual uploads keep the current comma CSV flow. Aeris uploads also accept
+            semicolon UtcTime logs and map CH4, C2H2, N2O, and GPS fields automatically.
           </p>
         </div>
 

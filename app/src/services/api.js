@@ -118,11 +118,70 @@ export async function saveMission(mission) {
   }
 }
 
+export async function updateMission(missionId, mission) {
+  if (!missionId) {
+    return null;
+  }
+
+  try {
+    const response = await fetch(
+      `${backendHttpUrl}/api/missions/${encodeURIComponent(missionId)}`,
+      {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        cache: "no-store",
+        body: JSON.stringify(mission),
+      },
+    );
+
+    if (!response.ok) {
+      return null;
+    }
+
+    return response.json();
+  } catch {
+    return null;
+  }
+}
+
 export async function listMissions() {
   try {
     const response = await fetch(`${backendHttpUrl}/api/missions`, {
       cache: "no-store",
     });
+
+    if (!response.ok) {
+      return [];
+    }
+
+    const payload = await response.json();
+    return Array.isArray(payload?.data) ? payload.data : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function listTelemetryHistory({ limit = 10000, from, to } = {}) {
+  try {
+    const query = new URLSearchParams();
+    if (Number.isFinite(limit) && limit > 0) {
+      query.set("limit", String(Math.floor(limit)));
+    }
+    if (typeof from === "string" && from.trim()) {
+      query.set("from", from.trim());
+    }
+    if (typeof to === "string" && to.trim()) {
+      query.set("to", to.trim());
+    }
+
+    const response = await fetch(
+      `${backendHttpUrl}/api/telemetry/history${query.size ? `?${query.toString()}` : ""}`,
+      {
+        cache: "no-store",
+      },
+    );
 
     if (!response.ok) {
       return [];
@@ -197,6 +256,14 @@ export async function runAerisAnalysis(payload) {
         responsePayload.imageDataUri
           ? responsePayload.imageDataUri
           : null,
+      imageDataUris: Array.isArray(responsePayload?.imageDataUris)
+        ? responsePayload.imageDataUris.filter(
+            (value) => typeof value === "string" && value,
+          )
+        : typeof responsePayload?.imageDataUri === "string" &&
+            responsePayload.imageDataUri
+          ? [responsePayload.imageDataUri]
+          : [],
       executionCount: responsePayload?.executionCount ?? null,
       cellIndex: responsePayload?.cellIndex ?? null,
       executedAt: responsePayload?.executedAt || null,

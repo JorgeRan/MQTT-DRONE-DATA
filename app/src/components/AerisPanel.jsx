@@ -118,6 +118,7 @@ export function AerisPanel({
   onAnalyze,
   analyzeBusy = false,
   initialTracerRates,
+  tracerAvailability,
 }) {
   const chartId = useId().replace(/:/g, "");
   const navigatorRef = useRef(null);
@@ -129,6 +130,8 @@ export function AerisPanel({
   const [nitrousOxideTracerRate, setNitrousOxideTracerRate] = useState(
     initialTracerRates?.nitrousOxide ?? "",
   );
+  const hasAcetyleneTracer = tracerAvailability?.acetylene ?? true;
+  const hasNitrousOxideTracer = tracerAvailability?.nitrousOxide ?? true;
   const dataLength = flowData.length;
   const maxIndex = Math.max(dataLength - 1, 0);
   const fullPeakValue = Math.max(
@@ -391,11 +394,12 @@ export function AerisPanel({
                   min="0"
                   step="0.1"
                   inputMode="decimal"
-                  placeholder="0.0"
+                  placeholder={hasAcetyleneTracer ? "0.0" : "No tracer in selection"}
                   value={acetyleneTracerRate}
                   onChange={(event) =>
                     setAcetyleneTracerRate(event.target.value)
                   }
+                  disabled={!hasAcetyleneTracer}
                   className="w-full bg-transparent text-sm font-semibold outline-none"
                   style={{ color: color.text }}
                 />
@@ -429,11 +433,12 @@ export function AerisPanel({
                   min="0"
                   step="0.1"
                   inputMode="decimal"
-                  placeholder="0.0"
+                  placeholder={hasNitrousOxideTracer ? "0.0" : "No tracer in selection"}
                   value={nitrousOxideTracerRate}
                   onChange={(event) =>
                     setNitrousOxideTracerRate(event.target.value)
                   }
+                  disabled={!hasNitrousOxideTracer}
                   className="w-full bg-transparent text-sm font-semibold outline-none"
                   style={{ color: color.text }}
                 />
@@ -463,8 +468,8 @@ export function AerisPanel({
               onClick={() => {
                 if (typeof onAnalyze === "function") {
                   onAnalyze({
-                    acetyleneTracerRate,
-                    nitrousOxideTracerRate,
+                    acetyleneTracerRate: hasAcetyleneTracer ? acetyleneTracerRate : "",
+                    nitrousOxideTracerRate: hasNitrousOxideTracer ? nitrousOxideTracerRate : "",
                   });
                   return;
                 }
@@ -562,8 +567,8 @@ export function AerisPanel({
             ];
 
             return (
-              <div key={chart.key} className="h-[180px] w-full">
-                <ResponsiveContainer width="100%" height="100%">
+              <div key={chart.key} className="h-[180px] w-full min-w-0">
+                <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={180}>
                   <AreaChart
                     data={flowData}
                     margin={{ top: 8, right: 6, left: 8, bottom: 18 }}

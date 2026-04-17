@@ -393,8 +393,8 @@ export function FlowChart({ flowData, selection, onSelectionChange, resultsPageM
           </div>
         </div>
 
-        <div className="h-[360px] w-full">
-          <ResponsiveContainer width="100%" height="100%">
+        <div className="h-[360px] w-full min-w-0">
+          <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={360}>
             <AreaChart
               data={flowData}
               margin={{ top: 8, right: 6, left: 8, bottom: 18 }}

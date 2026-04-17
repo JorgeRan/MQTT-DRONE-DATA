@@ -8,6 +8,127 @@ export const toFiniteNumber = (value) => {
   return Number.isFinite(parsed) ? parsed : null;
 };
 
+const toRadians = (degrees) => (degrees * Math.PI) / 180;
+
+export const calculateDistanceMeters = (
+  latitudeA,
+  longitudeA,
+  latitudeB,
+  longitudeB,
+) => {
+  const earthRadiusMeters = 6371000;
+  const deltaLatitude = toRadians(latitudeB - latitudeA);
+  const deltaLongitude = toRadians(longitudeB - longitudeA);
+  const a =
+    Math.sin(deltaLatitude / 2) ** 2 +
+    Math.cos(toRadians(latitudeA)) *
+      Math.cos(toRadians(latitudeB)) *
+      Math.sin(deltaLongitude / 2) ** 2;
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return earthRadiusMeters * c;
+};
+
+const median = (values) => {
+  if (!values.length) {
+    return null;
+  }
+
+  const sortedValues = [...values].sort((left, right) => left - right);
+  const middleIndex = Math.floor(sortedValues.length / 2);
+
+  if (sortedValues.length % 2 === 0) {
+    return (sortedValues[middleIndex - 1] + sortedValues[middleIndex]) / 2;
+  }
+
+  return sortedValues[middleIndex];
+};
+
+const quantile = (values, ratio) => {
+  if (!values.length) {
+    return null;
+  }
+
+  const sortedValues = [...values].sort((left, right) => left - right);
+  const boundedRatio = Math.min(1, Math.max(0, ratio));
+  const index = Math.floor((sortedValues.length - 1) * boundedRatio);
+  return sortedValues[index];
+};
+
+const hasFiniteCoordinates = (point) =>
+  Number.isFinite(toFiniteNumber(point?.latitude)) &&
+  Number.isFinite(toFiniteNumber(point?.longitude));
+
+export const filterCoordinateOutliers = (flowData, options = {}) => {
+  const {
+    minimumPoints = 6,
+    minimumThresholdMeters = 150,
+    percentileRatio = 0.9,
+    percentileMultiplier = 3,
+    medianMultiplier = 6,
+  } = options;
+
+  const points = Array.isArray(flowData) ? flowData : [];
+  const geoPoints = points.filter(hasFiniteCoordinates);
+
+  if (geoPoints.length < minimumPoints) {
+    return points;
+  }
+
+  const centerLatitude = median(
+    geoPoints
+      .map((point) => toFiniteNumber(point.latitude))
+      .filter((value) => value !== null),
+  );
+  const centerLongitude = median(
+    geoPoints
+      .map((point) => toFiniteNumber(point.longitude))
+      .filter((value) => value !== null),
+  );
+
+  if (!Number.isFinite(centerLatitude) || !Number.isFinite(centerLongitude)) {
+    return points;
+  }
+
+  const distances = geoPoints
+    .map((point) =>
+      calculateDistanceMeters(
+        centerLatitude,
+        centerLongitude,
+        toFiniteNumber(point.latitude),
+        toFiniteNumber(point.longitude),
+      ),
+    )
+    .filter((value) => Number.isFinite(value));
+
+  const medianDistance = median(distances);
+  const percentileDistance = quantile(distances, percentileRatio);
+
+  if (!Number.isFinite(medianDistance) || !Number.isFinite(percentileDistance)) {
+    return points;
+  }
+
+  const maxDistanceMeters = Math.max(
+    minimumThresholdMeters,
+    medianDistance * medianMultiplier,
+    percentileDistance * percentileMultiplier,
+  );
+
+  return points.filter((point) => {
+    if (!hasFiniteCoordinates(point)) {
+      return true;
+    }
+
+    const distanceFromCenter = calculateDistanceMeters(
+      centerLatitude,
+      centerLongitude,
+      toFiniteNumber(point.latitude),
+      toFiniteNumber(point.longitude),
+    );
+
+    return distanceFromCenter <= maxDistanceMeters;
+  });
+};
+
 export const pickFiniteMetric = (...values) => {
   for (const value of values) {
     const parsed = toFiniteNumber(value);
