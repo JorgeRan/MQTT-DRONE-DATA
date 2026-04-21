@@ -737,6 +737,14 @@ const normalizeTelemetry = (topic, rawPayload) => {
     rawPayload.c2h2,
     rawPayload.aeris?.acetylene,
   );
+  const nitrousOxide = pickNumber(
+    rawPayload.nitrousOxide,
+    rawPayload.nitrous_oxide,
+    rawPayload.n2o,
+    rawPayload.aeris?.nitrousOxide,
+    rawPayload.aeris?.nitrous_oxide,
+    rawPayload.aeris?.n2o,
+  );
   const ethylene = pickNumber(
     rawPayload.ethylene,
     rawPayload.c2h4,
@@ -758,7 +766,7 @@ const normalizeTelemetry = (topic, rawPayload) => {
       : typeof rawPayload.sensor_type === "string" &&
           rawPayload.sensor_type.trim()
         ? rawPayload.sensor_type.trim().toLowerCase()
-        : acetylene !== null || ethylene !== null
+        : acetylene !== null || nitrousOxide !== null || ethylene !== null
           ? "aeris"
           : "dual";
 
@@ -835,6 +843,7 @@ const normalizeTelemetry = (topic, rawPayload) => {
     sniffer,
     purway,
     acetylene,
+    nitrousOxide,
     ethylene,
     sensorMode,
     methane,
@@ -848,6 +857,7 @@ const normalizeTelemetry = (topic, rawPayload) => {
       sensorMode,
       methane,
       acetylene,
+      nitrousOxide,
       ethylene,
     },
   };
@@ -874,6 +884,7 @@ const telemetryToClientPayload = (telemetry, includeMetrics = true) => {
     sniffer: telemetry.sniffer,
     purway: telemetry.purway,
     acetylene: telemetry.acetylene,
+    nitrousOxide: telemetry.nitrousOxide,
     ethylene: telemetry.ethylene,
     sensorMode: telemetry.sensorMode,
     methane: telemetry.methane,

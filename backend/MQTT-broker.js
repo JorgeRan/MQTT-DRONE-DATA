@@ -11,11 +11,13 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer } from "ws";
 import sql from "./db.js";
+import { createRemoteMissionStore } from "./remoteMissionStore.js";
 import { createRemoteTelemetryStore } from "./remoteTelemetryStore.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+dotenv.config({ path: path.join(__dirname, "..", "app", ".env") });
 dotenv.config({ path: path.join(__dirname, ".env") });
 dotenv.config();
 
@@ -33,11 +35,28 @@ const mqttTopics = (
 const TELEMETRY_TABLE = "telemetry_events";
 const LATEST_STATE_TABLE = "drone_latest_state_cache";
 const MISSIONS_TABLE = "missions";
+const MISSION_SYNC_TABLE = "mission_remote_sync_queue";
 const INTERNET_CHECK_HOST =
   process.env.INTERNET_CHECK_HOST || "one.one.one.one";
 const INTERNET_CHECK_INTERVAL_MS = Math.max(
   2000,
   Number(process.env.INTERNET_CHECK_INTERVAL_MS || 5000),
+);
+const COORDINATE_OUTLIER_MAX_DISTANCE_METERS = Math.max(
+  100,
+  Number(process.env.COORDINATE_OUTLIER_MAX_DISTANCE_METERS || 1000),
+);
+const COORDINATE_OUTLIER_MAX_SPEED_MPS = Math.max(
+  1,
+  Number(process.env.COORDINATE_OUTLIER_MAX_SPEED_MPS || 60),
+);
+const COORDINATE_OUTLIER_MAX_TIME_GAP_SECONDS = Math.max(
+  1,
+  Number(process.env.COORDINATE_OUTLIER_MAX_TIME_GAP_SECONDS || 180),
+);
+const COORDINATE_OUTLIER_FILTER_GRACE_SECONDS = Math.max(
+  0,
+  Number(process.env.COORDINATE_OUTLIER_FILTER_GRACE_SECONDS || 120),
 );
 const REMOTE_SYNC_BATCH_SIZE = Math.max(
   1,
@@ -70,6 +89,9 @@ const remoteTelemetryStore = createRemoteTelemetryStore({
   telemetryTable: TELEMETRY_TABLE,
   latestStateTable: LATEST_STATE_TABLE,
 });
+const remoteMissionStore = createRemoteMissionStore({
+  missionsTable: MISSIONS_TABLE,
+});
 
 const PORT = Number(process.env.PORT || 3000);
 const app = express();
@@ -79,6 +101,7 @@ const wss = new WebSocketServer({ server, path: "/ws/telemetry" });
 let hasInternet = false;
 let internetCheckTimer = null;
 let syncInProgress = false;
+let missionSyncInProgress = false;
 let isAerisAnalysisRunning = false;
 let serialPortHandle = null;
 let serialTelemetryStatus = {
@@ -94,6 +117,8 @@ const measurementState = {
   accumulatedMs: 0,
   excludedDroneIds: new Set(),
 };
+const brokerStartedAtMs = Date.now();
+const droneOutlierGraceStartMsByDrone = new Map();
 
 const toExcludedDroneIdSet = (value) => {
   if (!Array.isArray(value)) {
@@ -587,6 +612,22 @@ const initializeDatabase = async () => {
     `CREATE INDEX IF NOT EXISTS idx_missions_created_at ON ${MISSIONS_TABLE} (created_at DESC)`,
   );
 
+  await sql.unsafe(`
+        CREATE TABLE IF NOT EXISTS ${MISSION_SYNC_TABLE} (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            mission_id TEXT,
+            action TEXT NOT NULL,
+            payload TEXT,
+            remote_synced INTEGER NOT NULL DEFAULT 0,
+            remote_synced_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    `);
+
+  await sql.unsafe(
+    `CREATE INDEX IF NOT EXISTS idx_mission_remote_sync_queue_pending ON ${MISSION_SYNC_TABLE} (remote_synced, id ASC)`,
+  );
+
   const ensureColumn = async (tableName, columnName, columnType) => {
     const columns = await sql.unsafe(`PRAGMA table_info(${tableName})`);
     if (!columns.some((column) => column.name === columnName)) {
@@ -607,6 +648,20 @@ const initializeDatabase = async () => {
     "INTEGER NOT NULL DEFAULT 0",
   );
   await ensureColumn(TELEMETRY_TABLE, "remote_synced_at", "TEXT");
+  await ensureColumn(MISSION_SYNC_TABLE, "mission_id", "TEXT");
+  await ensureColumn(MISSION_SYNC_TABLE, "action", "TEXT NOT NULL DEFAULT 'upsert'");
+  await ensureColumn(MISSION_SYNC_TABLE, "payload", "TEXT");
+  await ensureColumn(
+    MISSION_SYNC_TABLE,
+    "remote_synced",
+    "INTEGER NOT NULL DEFAULT 0",
+  );
+  await ensureColumn(MISSION_SYNC_TABLE, "remote_synced_at", "TEXT");
+  await ensureColumn(
+    MISSION_SYNC_TABLE,
+    "created_at",
+    "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP",
+  );
 
   await sql.unsafe(`
         CREATE TABLE IF NOT EXISTS ${LATEST_STATE_TABLE} (
@@ -667,6 +722,202 @@ const parseTimestamp = (value) => {
 
   const parsed = new Date(value);
   return Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+};
+
+const isValidLatitude = (value) =>
+  Number.isFinite(value) && value >= -90 && value <= 90;
+
+const isValidLongitude = (value) =>
+  Number.isFinite(value) && value >= -180 && value <= 180;
+
+const hasInvalidCoordinatePair = (latitude, longitude) => {
+  const hasLatitude = Number.isFinite(latitude);
+  const hasLongitude = Number.isFinite(longitude);
+
+  if (!hasLatitude && !hasLongitude) {
+    return false;
+  }
+
+  return (
+    !hasLatitude ||
+    !hasLongitude ||
+    !isValidLatitude(latitude) ||
+    !isValidLongitude(longitude)
+  );
+};
+
+const hasOriginCoordinatePair = (latitude, longitude) =>
+  Number(latitude) === 0 && Number(longitude) === 0;
+
+const sanitizeTargetCoordinatePair = (latitude, longitude) => {
+  if (hasOriginCoordinatePair(latitude, longitude)) {
+    return { latitude: null, longitude: null };
+  }
+
+  return { latitude, longitude };
+};
+
+const isSimulatorTelemetryPayload = (payload) =>
+  payload?.simulator === true || payload?.is_simulator === true;
+
+const isWithinOutlierGraceWindow = (droneId) => {
+  const graceMs = COORDINATE_OUTLIER_FILTER_GRACE_SECONDS * 1000;
+  if (graceMs <= 0) {
+    return false;
+  }
+
+  const now = Date.now();
+
+  if (now - brokerStartedAtMs <= graceMs) {
+    return true;
+  }
+
+  if (typeof droneId !== "string" || !droneId.trim()) {
+    return false;
+  }
+
+  const normalizedDroneId = droneId.trim();
+  const firstSeenMs =
+    droneOutlierGraceStartMsByDrone.get(normalizedDroneId) ?? now;
+
+  if (!droneOutlierGraceStartMsByDrone.has(normalizedDroneId)) {
+    droneOutlierGraceStartMsByDrone.set(normalizedDroneId, firstSeenMs);
+  }
+
+  return now - firstSeenMs <= graceMs;
+};
+
+const toRadians = (value) => (value * Math.PI) / 180;
+
+const haversineDistanceMeters = (from, to) => {
+  if (
+    !from ||
+    !to ||
+    !isValidLatitude(from.latitude) ||
+    !isValidLongitude(from.longitude) ||
+    !isValidLatitude(to.latitude) ||
+    !isValidLongitude(to.longitude)
+  ) {
+    return null;
+  }
+
+  const earthRadiusMeters = 6371000;
+  const latitudeDelta = toRadians(to.latitude - from.latitude);
+  const longitudeDelta = toRadians(to.longitude - from.longitude);
+  const fromLatitudeRadians = toRadians(from.latitude);
+  const toLatitudeRadians = toRadians(to.latitude);
+  const a =
+    Math.sin(latitudeDelta / 2) ** 2 +
+    Math.cos(fromLatitudeRadians) *
+      Math.cos(toLatitudeRadians) *
+      Math.sin(longitudeDelta / 2) ** 2;
+
+  return 2 * earthRadiusMeters * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+};
+
+const resolveTelemetryMapCoordinates = (telemetry) => {
+  const useTargetCoordinates = telemetry.payload?.map_coordinates === "target";
+  const latitude = useTargetCoordinates
+    ? telemetry.target_latitude ??
+      telemetry.payload?.target_latitude ??
+      telemetry.latitude
+    : telemetry.latitude;
+  const longitude = useTargetCoordinates
+    ? telemetry.target_longitude ??
+      telemetry.payload?.target_longitude ??
+      telemetry.longitude
+    : telemetry.longitude;
+
+  if (!isValidLatitude(latitude) || !isValidLongitude(longitude)) {
+    return null;
+  }
+
+  return { latitude, longitude };
+};
+
+const getTelemetryCoordinateOutlierReason = async (telemetry) => {
+  if (isSimulatorTelemetryPayload(telemetry.payload)) {
+    return null;
+  }
+
+  if (hasOriginCoordinatePair(telemetry.latitude, telemetry.longitude)) {
+    return "origin coordinates (0,0,0)";
+  }
+
+  if (
+    hasInvalidCoordinatePair(telemetry.latitude, telemetry.longitude) ||
+    hasInvalidCoordinatePair(
+      telemetry.target_latitude,
+      telemetry.target_longitude,
+    )
+  ) {
+    return "invalid coordinate range";
+  }
+
+  // Delay jump filtering briefly after startup or per-drone first sighting.
+  if (isWithinOutlierGraceWindow(telemetry.droneId)) {
+    return null;
+  }
+
+  const currentCoordinates = resolveTelemetryMapCoordinates(telemetry);
+  if (!currentCoordinates) {
+    return null;
+  }
+
+  const previousRows = await sql.unsafe(
+    `SELECT ts, latitude, longitude, target_latitude, target_longitude, payload FROM ${LATEST_STATE_TABLE} WHERE drone_id = $1`,
+    [telemetry.droneId],
+  );
+  const previous = previousRows[0];
+
+  if (!previous) {
+    return null;
+  }
+
+  const previousCoordinates = resolveTelemetryMapCoordinates({
+    ...previous,
+    payload: parsePayload(previous.payload),
+  });
+
+  if (!previousCoordinates) {
+    return null;
+  }
+
+  const distanceMeters = haversineDistanceMeters(
+    previousCoordinates,
+    currentCoordinates,
+  );
+
+  if (
+    !Number.isFinite(distanceMeters) ||
+    distanceMeters <= COORDINATE_OUTLIER_MAX_DISTANCE_METERS
+  ) {
+    return null;
+  }
+
+  const currentTimestampMs = telemetry.ts.getTime();
+  const previousTimestampMs = new Date(previous.ts).getTime();
+
+  if (!Number.isFinite(previousTimestampMs)) {
+    return `jumped ${Math.round(distanceMeters)}m with invalid timestamps`;
+  }
+
+  const elapsedSeconds =
+    Math.abs(currentTimestampMs - previousTimestampMs) / 1000;
+  if (elapsedSeconds > COORDINATE_OUTLIER_MAX_TIME_GAP_SECONDS) {
+    return null;
+  }
+
+  if (elapsedSeconds === 0) {
+    return `jumped ${Math.round(distanceMeters)}m at the same timestamp`;
+  }
+
+  const speedMetersPerSecond = distanceMeters / elapsedSeconds;
+  if (speedMetersPerSecond <= COORDINATE_OUTLIER_MAX_SPEED_MPS) {
+    return null;
+  }
+
+  return `jumped ${Math.round(distanceMeters)}m in ${elapsedSeconds.toFixed(1)}s (${speedMetersPerSecond.toFixed(1)}m/s)`;
 };
 
 const parseDroneId = (topic, payload) => {
@@ -737,6 +988,14 @@ const normalizeTelemetry = (topic, rawPayload) => {
     rawPayload.c2h2,
     rawPayload.aeris?.acetylene,
   );
+  const nitrousOxide = pickNumber(
+    rawPayload.nitrousOxide,
+    rawPayload.nitrous_oxide,
+    rawPayload.n2o,
+    rawPayload.aeris?.nitrousOxide,
+    rawPayload.aeris?.nitrous_oxide,
+    rawPayload.aeris?.n2o,
+  );
   const ethylene = pickNumber(
     rawPayload.ethylene,
     rawPayload.c2h4,
@@ -758,7 +1017,7 @@ const normalizeTelemetry = (topic, rawPayload) => {
       : typeof rawPayload.sensor_type === "string" &&
           rawPayload.sensor_type.trim()
         ? rawPayload.sensor_type.trim().toLowerCase()
-        : acetylene !== null || ethylene !== null
+        : acetylene !== null || nitrousOxide !== null || ethylene !== null
           ? "aeris"
           : "dual";
 
@@ -786,6 +1045,24 @@ const normalizeTelemetry = (topic, rawPayload) => {
     rawPayload.wind_w,
     rawPayload.windW,
     rawPayload.wind_direction?.z,
+  );
+  const normalizedTargetCoordinates = sanitizeTargetCoordinatePair(
+    pickNumber(
+      rawPayload.target_latitude,
+      rawPayload.target?.latitude,
+      rawPayload.target?.lat,
+      rawPayload.target_position?.latitude,
+      rawPayload.target_position?.lat,
+    ),
+    pickNumber(
+      rawPayload.target_longitude,
+      rawPayload.target?.longitude,
+      rawPayload.target?.lon,
+      rawPayload.target?.lng,
+      rawPayload.target_position?.longitude,
+      rawPayload.target_position?.lon,
+      rawPayload.target_position?.lng,
+    ),
   );
 
   return {
@@ -816,25 +1093,12 @@ const normalizeTelemetry = (topic, rawPayload) => {
       rawPayload.position?.alt,
       rawPayload.gps?.alt,
     ),
-    target_latitude: pickNumber(
-      rawPayload.target_latitude,
-      rawPayload.target?.latitude,
-      rawPayload.target?.lat,
-      rawPayload.target_position?.latitude,
-      rawPayload.target_position?.lat,
-    ),
-    target_longitude: pickNumber(
-      rawPayload.target_longitude,
-      rawPayload.target?.longitude,
-      rawPayload.target?.lon,
-      rawPayload.target?.lng,
-      rawPayload.target_position?.longitude,
-      rawPayload.target_position?.lon,
-      rawPayload.target_position?.lng,
-    ),
+    target_latitude: normalizedTargetCoordinates.latitude,
+    target_longitude: normalizedTargetCoordinates.longitude,
     sniffer,
     purway,
     acetylene,
+    nitrousOxide,
     ethylene,
     sensorMode,
     methane,
@@ -845,9 +1109,12 @@ const normalizeTelemetry = (topic, rawPayload) => {
       wind_u: windU,
       wind_v: windV,
       wind_w: windW,
+      target_latitude: normalizedTargetCoordinates.latitude,
+      target_longitude: normalizedTargetCoordinates.longitude,
       sensorMode,
       methane,
       acetylene,
+      nitrousOxide,
       ethylene,
     },
   };
@@ -874,6 +1141,7 @@ const telemetryToClientPayload = (telemetry, includeMetrics = true) => {
     sniffer: telemetry.sniffer,
     purway: telemetry.purway,
     acetylene: telemetry.acetylene,
+    nitrousOxide: telemetry.nitrousOxide,
     ethylene: telemetry.ethylene,
     sensorMode: telemetry.sensorMode,
     methane: telemetry.methane,
@@ -1040,6 +1308,68 @@ const toRemoteTelemetry = (row) => ({
   payload: parsePayload(row.payload),
 });
 
+const normalizeMissionRecord = (mission) => ({
+  id: typeof mission?.id === "string" ? mission.id.trim() : "",
+  name:
+    typeof mission?.name === "string" && mission.name.trim()
+      ? mission.name.trim()
+      : "Untitled Mission",
+  createdAt:
+    typeof mission?.createdAt === "string" && mission.createdAt.trim()
+      ? mission.createdAt
+      : new Date().toISOString(),
+  elapsedSeconds: Number.isFinite(Number(mission?.elapsedSeconds))
+    ? Math.max(0, Math.floor(Number(mission.elapsedSeconds)))
+    : 0,
+  results: Array.isArray(mission?.results) ? mission.results : [],
+});
+
+const enqueueMissionSyncOperation = async ({ missionId = null, action, payload = null }) => {
+  if (action === "clear") {
+    await sql.unsafe(`DELETE FROM ${MISSION_SYNC_TABLE} WHERE remote_synced = 0`);
+  } else if (missionId) {
+    await sql.unsafe(
+      `DELETE FROM ${MISSION_SYNC_TABLE} WHERE remote_synced = 0 AND mission_id = $1`,
+      [missionId],
+    );
+  }
+
+  await sql.unsafe(
+    `
+      INSERT INTO ${MISSION_SYNC_TABLE} (mission_id, action, payload, remote_synced, remote_synced_at)
+      VALUES ($1, $2, $3, 0, NULL)
+    `,
+    [missionId, action, payload],
+  );
+};
+
+const queueMissionUpsert = async (mission) => {
+  const normalizedMission = normalizeMissionRecord(mission);
+  await enqueueMissionSyncOperation({
+    missionId: normalizedMission.id,
+    action: "upsert",
+    payload: JSON.stringify(normalizedMission),
+  });
+};
+
+const queueMissionDelete = async (missionId) => {
+  await enqueueMissionSyncOperation({
+    missionId,
+    action: "delete",
+  });
+};
+
+const queueMissionClear = async () => {
+  await enqueueMissionSyncOperation({ action: "clear" });
+};
+
+const markMissionSyncComplete = async (id) => {
+  await sql.unsafe(
+    `UPDATE ${MISSION_SYNC_TABLE} SET remote_synced = 1, remote_synced_at = CURRENT_TIMESTAMP WHERE id = $1`,
+    [id],
+  );
+};
+
 const markTelemetrySynced = async (id) => {
   await sql.unsafe(
     `UPDATE ${TELEMETRY_TABLE} SET remote_synced = 1, remote_synced_at = CURRENT_TIMESTAMP WHERE id = $1`,
@@ -1098,6 +1428,60 @@ const syncPendingTelemetryToRemote = async () => {
   }
 };
 
+const syncPendingMissionsToRemote = async () => {
+  if (missionSyncInProgress || !remoteMissionStore.enabled) {
+    return;
+  }
+
+  missionSyncInProgress = true;
+
+  try {
+    while (true) {
+      const pendingRows = await sql.unsafe(
+        `
+          SELECT id, mission_id, action, payload
+          FROM ${MISSION_SYNC_TABLE}
+          WHERE remote_synced = 0
+          ORDER BY id ASC
+          LIMIT $1
+        `,
+        [REMOTE_SYNC_BATCH_SIZE],
+      );
+
+      if (pendingRows.length === 0) {
+        break;
+      }
+
+      for (const row of pendingRows) {
+        let mirrored = false;
+
+        if (row.action === "upsert") {
+          mirrored = await remoteMissionStore.upsertMission(
+            normalizeMissionRecord(parsePayload(row.payload)),
+          );
+        } else if (row.action === "delete") {
+          mirrored = await remoteMissionStore.deleteMission(row.mission_id);
+        } else if (row.action === "clear") {
+          mirrored = await remoteMissionStore.clearMissions();
+        } else {
+          console.warn(`Skipping unknown mission sync action: ${row.action}`);
+          mirrored = true;
+        }
+
+        if (!mirrored) {
+          return;
+        }
+
+        await markMissionSyncComplete(row.id);
+      }
+    }
+  } catch (error) {
+    console.warn(`Pending mission sync failed: ${error.message}`);
+  } finally {
+    missionSyncInProgress = false;
+  }
+};
+
 const startInternetChecker = async () => {
   const checkConnection = async () => {
     const wasOnline = hasInternet;
@@ -1108,6 +1492,7 @@ const startInternetChecker = async () => {
         "Internet connectivity restored. Syncing pending telemetry to Supabase...",
       );
       void syncPendingTelemetryToRemote();
+      void syncPendingMissionsToRemote();
     }
 
     if (wasOnline && !hasInternet) {
@@ -1117,6 +1502,7 @@ const startInternetChecker = async () => {
     }
 
     void syncPendingTelemetryToRemote();
+    void syncPendingMissionsToRemote();
   };
 
   await checkConnection();
@@ -1188,6 +1574,16 @@ const upsertTelemetry = async (telemetry) => {
 
 const ingestTelemetry = async ({ source, receivedTopic, rawPayload }) => {
   const telemetry = normalizeTelemetry(receivedTopic, rawPayload);
+
+  const coordinateOutlierReason = await getTelemetryCoordinateOutlierReason(
+    telemetry,
+  );
+  if (coordinateOutlierReason) {
+    console.warn(
+      `Ignoring telemetry for ${telemetry.droneId} on ${receivedTopic}: ${coordinateOutlierReason}`,
+    );
+    return;
+  }
 
   broadcastTelemetry(telemetry, { includeMetrics: true }, source);
 
@@ -1283,6 +1679,7 @@ app.get("/api/health", async (_req, res) => {
       database: "connected",
       measurement: measurementStatusPayload(),
       remoteDatabase: remoteTelemetryStore.getStatus(),
+      remoteMissionDatabase: remoteMissionStore.getStatus(),
     });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message });
@@ -1386,6 +1783,15 @@ app.post("/api/missions", async (req, res) => {
       ],
     );
 
+    await queueMissionUpsert({
+      id: missionId,
+      name: missionName,
+      createdAt,
+      elapsedSeconds,
+      results: missionResults,
+    });
+    await syncPendingMissionsToRemote();
+
     res.status(201).json({
       id: missionId,
       name: missionName,
@@ -1440,6 +1846,9 @@ app.delete("/api/missions/:id", async (req, res) => {
       return res.status(404).json({ error: "Mission not found" });
     }
 
+    await queueMissionDelete(missionId);
+    await syncPendingMissionsToRemote();
+
     return res.status(204).send();
   } catch (error) {
     console.error("Delete mission endpoint error:", error.message);
@@ -1457,6 +1866,9 @@ app.delete("/api/data", async (_req, res) => {
 
     await sql.unsafe(`DELETE FROM ${MISSIONS_TABLE}`);
     const deletedMissionRows = await sql.unsafe("SELECT changes() AS count");
+
+    await queueMissionClear();
+    await syncPendingMissionsToRemote();
 
     return res.json({
       ok: true,
@@ -1548,6 +1960,21 @@ app.put("/api/missions/:id", async (req, res) => {
       return false;
     };
 
+    const shouldReplaceField = (field, currentValue, incomingValue) => {
+      if (isBlank(incomingValue)) {
+        return false;
+      }
+
+      if (field === "distance") {
+        const numericCurrent = Number(currentValue);
+        if (!Number.isFinite(numericCurrent) || numericCurrent === 0) {
+          return true;
+        }
+      }
+
+      return isBlank(currentValue);
+    };
+
     const normalizeMissionResults = (results, fallbackDronePrefix) =>
       (Array.isArray(results) ? results : [])
         .map((entry, index) => ({
@@ -1615,7 +2042,7 @@ app.put("/api/missions/:id", async (req, res) => {
           const nextPoint = { ...currentPoint };
 
           Object.entries(incomingPoint).forEach(([field, value]) => {
-            if (isBlank(nextPoint[field]) && !isBlank(value)) {
+            if (shouldReplaceField(field, nextPoint[field], value)) {
               nextPoint[field] = value;
             }
           });
@@ -1647,6 +2074,15 @@ app.put("/api/missions/:id", async (req, res) => {
       `UPDATE ${MISSIONS_TABLE} SET results = $1 WHERE id = $2`,
       [JSON.stringify(mergedResults), missionId],
     );
+
+    await queueMissionUpsert({
+      id: missionId,
+      name: existing[0].name,
+      createdAt: existing[0].createdAt,
+      elapsedSeconds: existing[0].elapsedSeconds,
+      results: mergedResults,
+    });
+    await syncPendingMissionsToRemote();
 
     return res.json({
       id: missionId,
@@ -1860,6 +2296,7 @@ wss.on("connection", (socket) => {
 const startServer = async () => {
   await initializeDatabase();
   void remoteTelemetryStore.initialize();
+  void remoteMissionStore.initialize();
   hasInternet = await hasInternetConnection();
   await startInternetChecker();
   await startUdpListener();

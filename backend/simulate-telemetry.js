@@ -86,6 +86,7 @@ const publishTick = () => {
 
         const payload = {
             timestamp: new Date().toISOString(),
+            simulator: true,
             latitude: Number(drone.lat.toFixed(7)),
             longitude: Number(drone.lon.toFixed(7)),
             altitude: Number(drone.altitude.toFixed(1)),
