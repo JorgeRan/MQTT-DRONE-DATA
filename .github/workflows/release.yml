@@ -57,6 +57,13 @@ jobs:
           backend/.venv/Scripts/python.exe -m pip install --upgrade pip
           backend/.venv/Scripts/python.exe -m pip install -r backend/requirements.txt
 
+      - name: Create backend .env from secrets
+        shell: bash
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          echo "DATABASE_URL=${DATABASE_URL}" > backend/.env
+
       - name: Validate map token for build
         shell: bash
         env:
