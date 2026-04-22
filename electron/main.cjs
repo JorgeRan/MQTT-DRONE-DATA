@@ -141,12 +141,21 @@ function startBrokerProcess() {
     return;
   }
 
+  const brokerEnv = {
+    APP_DATA_DIR: app.getPath('userData'),
+    ELECTRON_RUN_AS_NODE: '1',
+  };
+
+  // In packaged builds, pass DATABASE_URL if available in process.env (set by CI)
+  // or from a config file if it exists
+  if (process.env.DATABASE_URL) {
+    brokerEnv.DATABASE_URL = process.env.DATABASE_URL;
+  }
+
   brokerProcess = startManagedChildProcess({
     name: 'mqtt-broker',
     scriptPath: getBrokerScriptPath(),
-    extraEnv: {
-      APP_DATA_DIR: app.getPath('userData'),
-    },
+    extraEnv: brokerEnv,
   });
 
   if (!brokerProcess) {

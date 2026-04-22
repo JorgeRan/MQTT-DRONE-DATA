@@ -67,6 +67,11 @@
         "filter": [
           "**/*"
         ]
+      },
+      {
+        "from": "backend/.env",
+        "to": "backend/.env",
+        "filter": []
       }
     ],
     "asar": false,
