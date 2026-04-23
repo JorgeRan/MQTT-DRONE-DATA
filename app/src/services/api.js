@@ -1,5 +1,21 @@
 const DEFAULT_LOCAL_BACKEND_HOST = "127.0.0.1";
-const DEFAULT_LOCAL_BACKEND_PORT = 3000;
+const DEFAULT_LOCAL_BACKEND_PORT = 43817;
+
+const resolveBackendPort = () => {
+  if (typeof window === "undefined") {
+    return DEFAULT_LOCAL_BACKEND_PORT;
+  }
+
+  try {
+    const electronBackendConfig = window.electronAPI?.getBackendConfig?.();
+    const candidatePort = Number(electronBackendConfig?.port);
+    if (Number.isInteger(candidatePort) && candidatePort > 0 && candidatePort <= 65535) {
+      return candidatePort;
+    }
+  } catch {}
+
+  return DEFAULT_LOCAL_BACKEND_PORT;
+};
 
 const resolveBackendHost = () => {
   if (typeof window === "undefined") {
@@ -21,9 +37,10 @@ const sleep = (delayMs) =>
   });
 
 const backendHost = resolveBackendHost();
+const backendPort = resolveBackendPort();
 
-export const backendHttpUrl = `http://${backendHost}:${DEFAULT_LOCAL_BACKEND_PORT}`;
-export const backendWsBaseUrl = `ws://${backendHost}:${DEFAULT_LOCAL_BACKEND_PORT}`;
+export const backendHttpUrl = `http://${backendHost}:${backendPort}`;
+export const backendWsBaseUrl = `ws://${backendHost}:${backendPort}`;
 
 export async function waitForBackendReady({
   attempts = 20,

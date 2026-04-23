@@ -2,9 +2,26 @@ const { app, BrowserWindow } = require('electron');
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
+const net = require('node:net');
+const { createSocket } = require('node:dgram');
 
 let bridgeProcess = null;
 let brokerProcess = null;
+let selectedBackendHttpPort = 43817;
+let selectedBackendUdpPort = 54817;
+
+const BACKEND_HTTP_PORT_START = Math.max(
+  1024,
+  Number(process.env.BACKEND_HTTP_PORT_START || 43817),
+);
+const BACKEND_UDP_PORT_START = Math.max(
+  1024,
+  Number(process.env.BACKEND_UDP_PORT_START || 54817),
+);
+const PORT_SEARCH_LIMIT = Math.max(
+  1,
+  Number(process.env.BACKEND_PORT_SEARCH_LIMIT || 200),
+);
 
 function getAppContentPath(...relativePath) {
   if (app.isPackaged) {
@@ -41,6 +58,77 @@ function getBridgeScriptPath() {
 
 function getBrokerScriptPath() {
   return getAppContentPath('backend', 'MQTT-broker.js');
+}
+
+function isTcpPortFree(port, host = '127.0.0.1') {
+  return new Promise((resolve) => {
+    const probe = net.createServer();
+
+    probe.once('error', () => {
+      resolve(false);
+    });
+
+    probe.listen(port, host, () => {
+      probe.close(() => resolve(true));
+    });
+  });
+}
+
+function isUdpPortFree(port, host = '0.0.0.0') {
+  return new Promise((resolve) => {
+    const probe = createSocket('udp4');
+
+    probe.once('error', () => {
+      try {
+        probe.close();
+      } catch {}
+      resolve(false);
+    });
+
+    probe.bind(port, host, () => {
+      probe.close(() => resolve(true));
+    });
+  });
+}
+
+async function findNextAvailablePort({
+  startPort,
+  host,
+  maxAttempts,
+  checker,
+}) {
+  for (let offset = 0; offset < maxAttempts; offset += 1) {
+    const candidate = startPort + offset;
+    // eslint-disable-next-line no-await-in-loop
+    const free = await checker(candidate, host);
+    if (free) {
+      return candidate;
+    }
+  }
+
+  throw new Error(
+    `No available port found from ${startPort} after ${maxAttempts} attempts`,
+  );
+}
+
+async function resolveBackendPorts() {
+  const [httpPort, udpPort] = await Promise.all([
+    findNextAvailablePort({
+      startPort: BACKEND_HTTP_PORT_START,
+      host: '127.0.0.1',
+      maxAttempts: PORT_SEARCH_LIMIT,
+      checker: isTcpPortFree,
+    }),
+    findNextAvailablePort({
+      startPort: BACKEND_UDP_PORT_START,
+      host: '0.0.0.0',
+      maxAttempts: PORT_SEARCH_LIMIT,
+      checker: isUdpPortFree,
+    }),
+  ]);
+
+  selectedBackendHttpPort = httpPort;
+  selectedBackendUdpPort = udpPort;
 }
 
 function startManagedChildProcess({
@@ -144,6 +232,8 @@ function startBrokerProcess() {
   const brokerEnv = {
     APP_DATA_DIR: app.getPath('userData'),
     ELECTRON_RUN_AS_NODE: '1',
+    PORT: String(selectedBackendHttpPort),
+    UDP_PORT: String(selectedBackendUdpPort),
   };
 
   // In packaged builds, pass DATABASE_URL if available in process.env (set by CI)
@@ -191,7 +281,10 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false
+      sandbox: false,
+      additionalArguments: [
+        `--backend-port=${selectedBackendHttpPort}`,
+      ],
     }
   };
 
@@ -227,9 +320,20 @@ app.whenReady().then(() => {
     }
   }
 
-  startBridgeProcess();
-  startBrokerProcess();
-  createWindow();
+  resolveBackendPorts()
+    .then(() => {
+      appendRuntimeLog(
+        'mqtt-broker',
+        `Resolved backend ports http=${selectedBackendHttpPort} udp=${selectedBackendUdpPort}`,
+      );
+      startBridgeProcess();
+      startBrokerProcess();
+      createWindow();
+    })
+    .catch((error) => {
+      console.error('Failed to resolve backend ports:', error.message);
+      app.quit();
+    });
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {

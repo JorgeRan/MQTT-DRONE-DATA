@@ -62,7 +62,7 @@ const REMOTE_SYNC_BATCH_SIZE = Math.max(
   1,
   Number(process.env.REMOTE_SYNC_BATCH_SIZE || 200),
 );
-const UDP_PORT = Math.max(1, Number(process.env.UDP_PORT || 5000));
+const UDP_PORT = Math.max(1, Number(process.env.UDP_PORT || 54817));
 const UDP_HOST = process.env.UDP_HOST || "0.0.0.0";
 const UDP_TOPIC_FALLBACK = process.env.UDP_TOPIC_FALLBACK || "udp/data";
 const SERIAL_TELEMETRY_PORT = (process.env.SERIAL_TELEMETRY_PORT || "").trim();
@@ -93,11 +93,17 @@ const remoteMissionStore = createRemoteMissionStore({
   missionsTable: MISSIONS_TABLE,
 });
 
-const PORT = Number(process.env.PORT || 3000);
+const PORT = Number(process.env.PORT || 43817);
+const PORT_FALLBACK_ATTEMPTS = Math.max(
+  1,
+  Number(process.env.PORT_FALLBACK_ATTEMPTS || 50),
+);
 const app = express();
 const server = createServer(app);
 const udpServer = createSocket("udp4");
 const wss = new WebSocketServer({ server, path: "/ws/telemetry" });
+let activeHttpPort = PORT;
+let activeUdpPort = UDP_PORT;
 let hasInternet = false;
 let internetCheckTimer = null;
 let syncInProgress = false;
@@ -1611,12 +1617,40 @@ const startUdpListener = async () => {
     }
   });
 
-  await new Promise((resolve) => {
-    udpServer.bind(UDP_PORT, UDP_HOST, () => {
-      console.log(`UDP listener active on ${UDP_HOST}:${UDP_PORT}`);
-      resolve();
+  let bound = false;
+  for (let offset = 0; offset < PORT_FALLBACK_ATTEMPTS && !bound; offset += 1) {
+    const candidatePort = UDP_PORT + offset;
+
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((resolve, reject) => {
+      const handleError = (error) => {
+        udpServer.off("error", handleError);
+
+        if (error?.code === "EADDRINUSE") {
+          resolve(false);
+          return;
+        }
+
+        reject(error);
+      };
+
+      udpServer.once("error", handleError);
+      udpServer.bind(candidatePort, UDP_HOST, () => {
+        udpServer.off("error", handleError);
+        activeUdpPort = candidatePort;
+        bound = true;
+        resolve(true);
+      });
     });
-  });
+  }
+
+  if (!bound) {
+    throw new Error(
+      `Unable to bind UDP port starting at ${UDP_PORT} after ${PORT_FALLBACK_ATTEMPTS} attempts`,
+    );
+  }
+
+  console.log(`UDP listener active on ${UDP_HOST}:${activeUdpPort}`);
 };
 
 const client = mqtt.connect(brokerUrl, {
@@ -1673,7 +1707,7 @@ app.get("/api/health", async (_req, res) => {
       mqttTopics,
       udp: {
         host: UDP_HOST,
-        port: UDP_PORT,
+        port: activeUdpPort,
       },
       serial: serialTelemetryStatus,
       database: "connected",
@@ -2302,9 +2336,45 @@ const startServer = async () => {
   await startUdpListener();
   await startSerialTelemetryListener();
 
-  server.listen(PORT, "0.0.0.0", () => {
-    console.log(`http://0.0.0.0:${PORT}`);
-  });
+  let listening = false;
+
+  for (
+    let offset = 0;
+    offset < PORT_FALLBACK_ATTEMPTS && !listening;
+    offset += 1
+  ) {
+    const candidatePort = PORT + offset;
+
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((resolve, reject) => {
+      const handleError = (error) => {
+        server.off("error", handleError);
+
+        if (error?.code === "EADDRINUSE") {
+          resolve(false);
+          return;
+        }
+
+        reject(error);
+      };
+
+      server.once("error", handleError);
+      server.listen(candidatePort, "0.0.0.0", () => {
+        server.off("error", handleError);
+        activeHttpPort = candidatePort;
+        listening = true;
+        resolve(true);
+      });
+    });
+  }
+
+  if (!listening) {
+    throw new Error(
+      `Unable to bind HTTP port starting at ${PORT} after ${PORT_FALLBACK_ATTEMPTS} attempts`,
+    );
+  }
+
+  console.log(`http://0.0.0.0:${activeHttpPort}`);
 };
 
 const stopInternetChecker = () => {
