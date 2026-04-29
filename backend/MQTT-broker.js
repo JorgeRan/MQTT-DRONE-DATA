@@ -276,7 +276,8 @@ function parseAerisLine(line) {
   return result;
 }
 
-app.use(express.json());
+app.use(express.json({ limit: "100mb" }));
+app.use(express.urlencoded({ extended: true, limit: "100mb" }));
 app.post("/api/serial-port", (req, res) => {
   const { port, baudRate } = req.body || {};
   if (!port) return res.status(400).json({ error: "Missing port" });
@@ -712,7 +713,7 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(express.json({ limit: "500mb" }));
+app.use(express.json({ limit: "100mb" }));
 
 const initializeDatabase = async () => {
   await sql.unsafe(`
