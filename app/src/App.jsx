@@ -112,10 +112,37 @@ const getTelemetryCoordinate = (source, axis) => {
   );
 };
 
-const getTelemetryWindComponent = (payload, axis) =>
-  toFiniteNumber(payload?.[`wind_${axis}`]) ??
-  toFiniteNumber(payload?.wind_direction?.[axis]) ??
-  0;
+const getTelemetryWindComponent = (payload, axis) => {
+  // Try wind_u/v/w, wind_x/y/z, and wind_direction.x/y/z
+  if (axis === "x" || axis === "u") {
+    return (
+      toFiniteNumber(payload?.wind_u) ??
+      toFiniteNumber(payload?.wind_x) ??
+      toFiniteNumber(payload?.wind_direction?.x) ??
+      toFiniteNumber(payload?.wind_direction?.u) ??
+      0
+    );
+  }
+  if (axis === "y" || axis === "v") {
+    return (
+      toFiniteNumber(payload?.wind_v) ??
+      toFiniteNumber(payload?.wind_y) ??
+      toFiniteNumber(payload?.wind_direction?.y) ??
+      toFiniteNumber(payload?.wind_direction?.v) ??
+      0
+    );
+  }
+  if (axis === "z" || axis === "w") {
+    return (
+      toFiniteNumber(payload?.wind_w) ??
+      toFiniteNumber(payload?.wind_z) ??
+      toFiniteNumber(payload?.wind_direction?.z) ??
+      toFiniteNumber(payload?.wind_direction?.w) ??
+      0
+    );
+  }
+  return 0;
+};
 
 const getTraceDisplayMetric = (point) => {
   if (point.sensorMode === SENSOR_MODE_AERIS) {
@@ -283,6 +310,7 @@ const appendFlowPoint = (series, telemetryRow) => {
 
   return [...existingSeries, nextPoint]
     .sort((a, b) => a.timestampMs - b.timestampMs)
+    .slice(-5000)
     .map((point, index) => ({
       ...point,
       sampleOrder: index,

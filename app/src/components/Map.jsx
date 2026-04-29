@@ -1,77 +1,6 @@
-// Utility to compute distance between two coordinates (in meters, using Haversine formula)
-function haversineDistance(lat1, lon1, lat2, lon2) {
-  const R = 6371000; // Earth radius in meters
-  const toRad = (deg) => (deg * Math.PI) / 180;
-  const dLat = toRad(lat2 - lat1);
-  const dLon = toRad(lon2 - lon1);
-  const a =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos(toRad(lat1)) *
-      Math.cos(toRad(lat2)) *
-      Math.sin(dLon / 2) *
-      Math.sin(dLon / 2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  return R * c;
-}
-
-// Utility to blend two hex colors by averaging their RGB values
-function blendColors(colors) {
-  if (!colors.length) return '#fff';
-  let r = 0, g = 0, b = 0;
-  colors.forEach(hex => {
-    if (hex[0] === '#') hex = hex.slice(1);
-    if (hex.length === 3) hex = hex.split('').map(x => x + x).join('');
-    r += parseInt(hex.slice(0, 2), 16);
-    g += parseInt(hex.slice(2, 4), 16);
-    b += parseInt(hex.slice(4, 6), 16);
-  });
-  r = Math.round(r / colors.length);
-  g = Math.round(g / colors.length);
-  b = Math.round(b / colors.length);
-  return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`;
-}
-
-// Merge points that are within a threshold (meters) and blend their colors
-function mergeNearbyPoints(features, getColor, threshold = 0.5) {
-  const merged = [];
-  for (let i = 0; i < features.length; ++i) {
-    const f1 = features[i];
-    if (!f1) continue;
-    const { coordinates } = f1.geometry;
-    const group = [f1];
-    const colors = [getColor(f1)];
-    for (let j = i + 1; j < features.length; ++j) {
-      const f2 = features[j];
-      if (!f2) continue;
-      const c2 = f2.geometry.coordinates;
-      if (haversineDistance(coordinates[1], coordinates[0], c2[1], c2[0]) < threshold) {
-        group.push(f2);
-        colors.push(getColor(f2));
-        features[j] = null; // Mark as merged
-      }
-    }
-    // Merge properties: keep highest purway, average methane, blend color
-    const avgMethane = group.reduce((sum, f) => sum + (Number(f.properties.methane) || 0), 0) / group.length;
-    const maxPurway = group.reduce((max, f) => {
-      const val = Number(f.properties.purway);
-      return Number.isFinite(val) && val > max ? val : max;
-    }, -Infinity);
-    const mergedFeature = {
-      ...f1,
-      properties: {
-        ...f1.properties,
-        methane: avgMethane,
-        purway: maxPurway,
-        mergedCount: group.length,
-        markerColor: blendColors(colors),
-      },
-    };
-    merged.push(mergedFeature);
-  }
-  return merged;
-}
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import mapboxgl from "mapbox-gl";
+import m350Marker from "../assets/M350.png";
 import satelliteImage from "../assets/satellite.png";
 import { tw, color } from "../constants/tailwind";
 import {
@@ -521,33 +450,23 @@ export function Map({
     [visibleDroneIds],
   );
   const hasVisibilityFilter = Array.isArray(visibleDroneIds);
-  const displayedTraceDataset = useMemo(() => {
-    let dataset = buildDisplayedTraceDataset(
-      traceDataset,
-      showTargetMarkers,
-      visibleDroneIdSet,
+  const displayedTraceDataset = useMemo(
+    () =>
+      buildDisplayedTraceDataset(
+        traceDataset,
+        showTargetMarkers,
+        visibleDroneIdSet,
+        hasVisibilityFilter,
+        missionConfiguration
+      ),
+    [
       hasVisibilityFilter,
-      missionConfiguration
-    );
-    if (!resultsPageMode && dataset?.features?.length) {
-      // Use the same color logic as your methane color scale for each feature
-      const getColor = (feature) => buildMethaneColorExpression(feature.properties.methane, lowerLimit, upperLimit);
-      dataset = {
-        ...dataset,
-        features: mergeNearbyPoints(dataset.features, getColor, 2), // 2 meters threshold
-      };
-    }
-    return dataset;
-  }, [
-    hasVisibilityFilter,
-    showTargetMarkers,
-    traceDataset,
-    visibleDroneIdSet,
-    missionConfiguration,
-    resultsPageMode,
-    lowerLimit,
-    upperLimit,
-  ]);
+      showTargetMarkers,
+      traceDataset,
+      visibleDroneIdSet,
+      missionConfiguration,
+    ],
+  );
   const flightPathDataset = useMemo(
     () =>
       resultsPageMode
@@ -688,6 +607,7 @@ export function Map({
 
     map.addControl(new mapboxgl.NavigationControl(), "top-right");
 
+    
 
     map.on("load", () => {
       if (!isOnlineMode && !resultsPageMode) {
@@ -723,64 +643,13 @@ export function Map({
         minimumLegendSpan,
       );
       const initialHeatmapThreshold = initialLowerLimit + initialSpan * 0.04;
+
       map.addSource("methane-traces", {
         type: "geojson",
         data: initialTraceDatasetRef.current,
-        ...(resultsPageMode
-          ? {}
-          : {
-              cluster: true,
-              clusterMaxZoom: 16, // Max zoom to cluster points on
-              clusterRadius: 32,  // Radius of each cluster when clustering points (defaults to 50)
-            }),
-      });
-      map.addLayer({
-        id: "methane-trace-clusters",
-        type: "circle",
-        source: "methane-traces",
-        filter: ["has", "point_count"],
-        paint: {
-          "circle-color": [
-            "step",
-            ["get", "point_count"],
-            "#fbb03b",
-            100, "#f28cb1",
-            750, "#51bbd6"
-          ],
-          "circle-radius": [
-            "step",
-            ["get", "point_count"],
-            18,
-            100, 24,
-            750, 32
-          ],
-          "circle-opacity": 0.7
-        }
       });
 
-      // Cluster count labels
-      if (!resultsPageMode) {
-        map.addLayer({
-          id: "methane-trace-cluster-count",
-          type: "symbol",
-          source: "methane-traces",
-          filter: ["has", "point_count"],
-          layout: {
-            "text-field": "{point_count_abbreviated}",
-            "text-font": ["DIN Offc Pro Medium", "Arial Unicode MS Bold"],
-            "text-size": 14
-          },
-          paint: {
-            "text-color": "#222",
-            "text-halo-color": "#fff",
-            "text-halo-width": 1.2
-          }
-        });
-      }
-
       map.addLayer({
-        // Cluster circles
-
         id: "methane-trace-heatmap",
         type: "heatmap",
         source: "methane-traces",
@@ -1137,50 +1006,30 @@ export function Map({
         });
 
         if (plumeViewEnabled) {
-
-          if (!resultsPageMode) {
-            map.addLayer({
-              id: "methane-trace-clusters",
-              type: "circle",
-              source: "methane-traces",
-              filter: ["has", "point_count"],
-              paint: {
-                "circle-color": [
-                  "step",
-                  ["get", "point_count"],
-                  "#fbb03b",
-                  100, "#f28cb1",
-                  750, "#51bbd6"
-                ],
-                "circle-radius": [
-                  "step",
-                  ["get", "point_count"],
-                  18,
-                  100, 24,
-                  750, 32
-                ],
-                "circle-opacity": 0.7
-              }
-            });
-            map.addLayer({
-              id: "methane-trace-cluster-count",
-              type: "symbol",
-              source: "methane-traces",
-              filter: ["has", "point_count"],
-              layout: {
-                "text-field": "{point_count_abbreviated}",
-                "text-font": ["DIN Offc Pro Medium", "Arial Unicode MS Bold"],
-                "text-size": 14
-              },
-              paint: {
-                "text-color": "#222",
-                "text-halo-color": "#fff",
-                "text-halo-width": 1.2
-              }
-            });
-          }
+          map.easeTo({
+            pitch: 72,
+            bearing: 34,
+            duration: 0,
+            essential: true,
+          });
         }
-        // map.on("move", syncPlumeModeFromTilt);
+
+        const syncPlumeModeFromTilt = () => {
+          const pitch = map.getPitch();
+
+          if (!plumeModeFromTiltRef.current && pitch >= 45) {
+            plumeModeFromTiltRef.current = true;
+            onPlumeViewAutoChange?.(true);
+            return;
+          }
+
+          if (plumeModeFromTiltRef.current && pitch <= 25) {
+            plumeModeFromTiltRef.current = false;
+            onPlumeViewAutoChange?.(false);
+          }
+        };
+
+        map.on("move", syncPlumeModeFromTilt);
       }
 
       map.resize();
@@ -1867,20 +1716,20 @@ export function Map({
                 </button>
                 <span className="text-sm" style={{ color: color.textMuted }}>Flight Path</span>
               </div>
-
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => setShowTargetMarkers((previous) => !previous)}
-                  className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-300 ease-in-out focus:outline-none ${showTargetMarkers ? "bg-yellow-400" : "bg-gray-300"}`}
-                >
-                  <span
-                    className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition-transform duration-300 ease-in-out ${showTargetMarkers ? "translate-x-5" : "translate-x-0"}`}
-                  />
-                </button>
-                <span className="text-sm" style={{ color: color.textMuted }}>Target Markers</span>
-              </div>
-
+             
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowTargetMarkers((previous) => !previous)}
+                    className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-300 ease-in-out focus:outline-none ${showTargetMarkers ? "bg-yellow-400" : "bg-gray-300"}`}
+                  >
+                    <span
+                      className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition-transform duration-300 ease-in-out ${showTargetMarkers ? "translate-x-5" : "translate-x-0"}`}
+                    />
+                  </button>
+                  <span className="text-sm" style={{ color: color.textMuted }}>Target Markers</span>
+                </div>
+            
             </div>
           </div>
         </div>

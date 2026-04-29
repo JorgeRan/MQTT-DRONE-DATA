@@ -1,3 +1,4 @@
+
 import { ReadlineParser } from "serialport";
 import mqtt from "mqtt";
 import express from "express";
@@ -87,6 +88,7 @@ const AERIS_NOTEBOOK_TIMEOUT_MS = Math.max(
   10000,
   Number(process.env.AERIS_NOTEBOOK_TIMEOUT_MS || 180000),
 );
+// REMOTE_DB_PENDING_QUEUE_SIZE now defaults to 10,000 for telemetry batching
 const remoteTelemetryStore = createRemoteTelemetryStore({
   telemetryTable: TELEMETRY_TABLE,
   latestStateTable: LATEST_STATE_TABLE,
@@ -831,6 +833,19 @@ const initializeDatabase = async () => {
     "INTEGER NOT NULL DEFAULT 0",
   );
   await ensureColumn(TELEMETRY_TABLE, "remote_synced_at", "TEXT");
+
+  // Add session columns for batch-based sessions
+  await ensureColumn(TELEMETRY_TABLE, "session_id", "TEXT");
+  await ensureColumn(TELEMETRY_TABLE, "session_first_sample_time", "TEXT");
+  await ensureColumn(TELEMETRY_TABLE, "session_last_sample_time", "TEXT");
+
+  // Create telemetry_sessions table for session metadata
+  await sql.unsafe(`CREATE TABLE IF NOT EXISTS telemetry_sessions (
+    session_id TEXT PRIMARY KEY,
+    first_sample_time TEXT NOT NULL,
+    last_sample_time TEXT NOT NULL,
+    sample_count INTEGER NOT NULL
+  )`);
   await ensureColumn(MISSION_SYNC_TABLE, "mission_id", "TEXT");
   await ensureColumn(MISSION_SYNC_TABLE, "action", "TEXT NOT NULL DEFAULT 'upsert'");
   await ensureColumn(MISSION_SYNC_TABLE, "payload", "TEXT");
@@ -1820,7 +1835,45 @@ const startInternetChecker = async () => {
   }, INTERNET_CHECK_INTERVAL_MS);
 };
 
+
+// --- Batch-based session logic ---
+let currentSessionId = null;
+let currentSessionCount = 0;
+let currentSessionFirstTime = null;
+let currentSessionLastTime = null;
+const SESSION_BATCH_SIZE = 10000;
+
+function generateSessionId() {
+  // Use ISO timestamp and random suffix for uniqueness
+  return `session_${new Date().toISOString().replace(/[-:.TZ]/g, "")}_${Math.floor(Math.random()*100000)}`;
+}
+
 const upsertTelemetry = async (telemetry) => {
+  // Start new session if needed
+  if (!currentSessionId || currentSessionCount >= SESSION_BATCH_SIZE) {
+    if (currentSessionId && currentSessionCount > 0) {
+      // Save previous session metadata
+      await sql.unsafe(
+        `INSERT OR REPLACE INTO telemetry_sessions (session_id, first_sample_time, last_sample_time, sample_count) VALUES (?, ?, ?, ?)`,
+        [currentSessionId, currentSessionFirstTime, currentSessionLastTime, currentSessionCount]
+      );
+    }
+    currentSessionId = generateSessionId();
+    currentSessionCount = 0;
+    currentSessionFirstTime = null;
+    currentSessionLastTime = null;
+  }
+
+  // Track first/last sample time
+  const tsString = typeof telemetry.ts === "string" ? telemetry.ts : (telemetry.ts?.toISOString?.() || String(telemetry.ts));
+  if (!currentSessionFirstTime || tsString < currentSessionFirstTime) currentSessionFirstTime = tsString;
+  if (!currentSessionLastTime || tsString > currentSessionLastTime) currentSessionLastTime = tsString;
+
+  // Add session info to telemetry
+  telemetry.session_id = currentSessionId;
+  telemetry.session_first_sample_time = currentSessionFirstTime;
+  telemetry.session_last_sample_time = currentSessionLastTime;
+
   const values = [
     telemetry.droneId,
     telemetry.topic,
@@ -1835,12 +1888,15 @@ const upsertTelemetry = async (telemetry) => {
     telemetry.purway,
     telemetry.distance,
     telemetry.payload,
+    telemetry.session_id,
+    telemetry.session_first_sample_time,
+    telemetry.session_last_sample_time,
   ];
 
   await sql.unsafe(
     `
-        INSERT INTO ${TELEMETRY_TABLE} (drone_id, topic, ts, latitude, longitude, altitude, target_latitude, target_longitude, methane, sniffer, purway, distance, payload, remote_synced, remote_synced_at)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 0, NULL)
+        INSERT INTO ${TELEMETRY_TABLE} (drone_id, topic, ts, latitude, longitude, altitude, target_latitude, target_longitude, methane, sniffer, purway, distance, payload, session_id, session_first_sample_time, session_last_sample_time, remote_synced, remote_synced_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, 0, NULL)
         `,
     values,
   );
@@ -1867,8 +1923,10 @@ const upsertTelemetry = async (telemetry) => {
             distance = EXCLUDED.distance,
             payload = EXCLUDED.payload
         `,
-    values,
+    values.slice(0, 13),
   );
+
+  currentSessionCount++;
 
   if (remoteTelemetryStore.enabled && localId !== undefined) {
     const mirrored = await remoteTelemetryStore.mirrorTelemetry({
@@ -2100,6 +2158,17 @@ app.get("/api/health", async (_req, res) => {
     });
   } catch (error) {
     res.status(500).json({ ok: false, error: error.message });
+  }
+});
+
+app.get("/api/telemetry-sessions", async (_req, res) => {
+  try {
+    const sessions = await sql.unsafe(
+      `SELECT session_id, first_sample_time, last_sample_time, sample_count FROM telemetry_sessions ORDER BY first_sample_time DESC`
+    );
+    res.json({ data: sessions });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
