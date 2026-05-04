@@ -104,7 +104,7 @@ const shouldIncludeMethaneValidity = (source, visibility) => {
     return visibility.invalid;
   }
 
-  return false;
+  return visibility.noData;
 };
 
 const sensorModePresentation = (sensorMode) => {
@@ -773,6 +773,7 @@ export function ResultsPage({
   const [methaneValidityVisibility, setMethaneValidityVisibility] = useState({
     valid: true,
     invalid: true,
+    noData: false,
   });
   const [isReplayPlaying, setIsReplayPlaying] = useState(false);
   const [isAnalyzeModalOpen, setIsAnalyzeModalOpen] = useState(false);
@@ -993,11 +994,12 @@ export function ResultsPage({
     const filtered = selectedFlowData.filter((point) =>
       shouldIncludeMethaneValidity(point, methaneValidityVisibility),
     );
-    const counts = { valid: 0, invalid: 0, null: 0 };
+    const counts = { valid: 0, invalid: 0, noData: 0, null: 0 };
     for (const p of selectedFlowData) {
       const v = p.methane_valid;
       if (v === 1) counts.valid++;
       else if (v === 2) counts.invalid++;
+      else if (v === 0) counts.noData++;
       else counts.null++;
     }
     if (selectedFlowData.length > 0) {
@@ -1006,7 +1008,7 @@ export function ResultsPage({
       console.log("[methane_valid filter] sample point.methane_valid:", sample.methane_valid, "| typeof payload:", typeof sample.payload, "| payload.methane_valid:", sample.payload?.methane_valid);
     }
     console.log(
-      `[methane_valid filter] visibility=${JSON.stringify(methaneValidityVisibility)} | total=${selectedFlowData.length} (valid=1: ${counts.valid}, invalid=2: ${counts.invalid}, null: ${counts.null}) → kept=${filtered.length}, removed=${selectedFlowData.length - filtered.length}`,
+      `[methane_valid filter] visibility=${JSON.stringify(methaneValidityVisibility)} | total=${selectedFlowData.length} (valid=1: ${counts.valid}, invalid=2: ${counts.invalid}, no-data=0: ${counts.noData}, null: ${counts.null}) → kept=${filtered.length}, removed=${selectedFlowData.length - filtered.length}`,
     );
     return filtered;
   }, [selectedFlowData, methaneValidityVisibility]);
@@ -1353,7 +1355,7 @@ export function ResultsPage({
 
   const handleToggleMethaneValidityVisibility = useCallback((key) => {
     setMethaneValidityVisibility((previous) => {
-      if (key !== "valid" && key !== "invalid") {
+      if (key !== "valid" && key !== "invalid" && key !== "noData") {
         return previous;
       }
 
@@ -1362,7 +1364,7 @@ export function ResultsPage({
         [key]: !previous[key],
       };
 
-      if (!next.valid && !next.invalid) {
+      if (!next.valid && !next.invalid && !next.noData) {
         next[key] = true;
       }
 

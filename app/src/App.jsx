@@ -156,8 +156,8 @@ const shouldIncludeMethaneValidity = (source, visibility) => {
     return visibility.invalid;
   }
 
-  // methane_valid=0 is explicit invalid/unknown quality from source data.
-  return false;
+  // methane_valid=0 represents explicit unknown/no-data quality.
+  return visibility.noData;
 };
 
 const getTelemetryCoordinate = (source, axis) => {
@@ -387,19 +387,49 @@ const appendFlowPoint = (series, telemetryRow) => {
     return existingSeries;
   }
 
-  const nextPoint = buildFlowPointFromTelemetry(
-    telemetryRow,
-    existingSeries.length,
+  const nextTimestampMs = new Date(telemetryRow.ts || Date.now()).getTime();
+  const lastPoint = existingSeries[existingSeries.length - 1] || null;
+
+  // Fast path for ordered telemetry streams (the common case).
+  if (!lastPoint || nextTimestampMs >= lastPoint.timestampMs) {
+    const nextPoint = buildFlowPointFromTelemetry(
+      telemetryRow,
+      existingSeries.length,
+    );
+    return [...existingSeries, nextPoint];
+  }
+
+  // Keep stable ordering when an out-of-order packet arrives.
+  let low = 0;
+  let high = existingSeries.length;
+
+  while (low < high) {
+    const midpoint = Math.floor((low + high) / 2);
+    if (existingSeries[midpoint].timestampMs <= nextTimestampMs) {
+      low = midpoint + 1;
+    } else {
+      high = midpoint;
+    }
+  }
+
+  const insertionIndex = low;
+  const nextSeries = existingSeries.slice();
+  nextSeries.splice(
+    insertionIndex,
+    0,
+    buildFlowPointFromTelemetry(telemetryRow, insertionIndex),
   );
 
-  return [...existingSeries, nextPoint]
-    .sort((a, b) => a.timestampMs - b.timestampMs)
-    .slice(-5000)
-    .map((point, index) => ({
+  for (let index = insertionIndex; index < nextSeries.length; index += 1) {
+    const point = nextSeries[index];
+    nextSeries[index] = {
       ...point,
       sampleOrder: index,
       sampleIndex: index + 1,
-    }));
+    };
+  }
+
+  return nextSeries;
 };
 
 const buildCombinedFlowDataForDrones = ({
@@ -473,6 +503,7 @@ function App() {
   const [methaneValidityVisibility, setMethaneValidityVisibility] = useState({
     valid: true,
     invalid: true,
+    noData: false,
   });
   const [dashboardDroneVisibility, setDashboardDroneVisibility] = useState(() =>
     devices.reduce((accumulator, device) => {
@@ -927,7 +958,7 @@ function App() {
 
   const handleToggleMethaneValidityVisibility = useCallback((key) => {
     setMethaneValidityVisibility((previous) => {
-      if (key !== "valid" && key !== "invalid") {
+      if (key !== "valid" && key !== "invalid" && key !== "noData") {
         return previous;
       }
 
@@ -936,7 +967,7 @@ function App() {
         [key]: !previous[key],
       };
 
-      if (!next.valid && !next.invalid) {
+      if (!next.valid && !next.invalid && !next.noData) {
         // Keep at least one methane_valid category visible.
         next[key] = true;
       }

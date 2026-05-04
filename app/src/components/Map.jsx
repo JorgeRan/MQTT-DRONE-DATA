@@ -49,6 +49,8 @@ const DRONE_COLOR_FALLBACK_PALETTE = [
   "#eab308",
   "#14b8a6",
 ];
+const EMPTY_FEATURE_COLLECTION = { type: "FeatureCollection", features: [] };
+const DASHBOARD_TRACE_SOURCE_UPDATE_DEBOUNCE_MS = 150;
 
 const toFiniteNumber = (value) => {
   const parsed = Number(value);
@@ -396,7 +398,7 @@ export function Map({
   onToggleAllPlottedData,
   droneVisibilityById = {},
   onToggleDroneVisibility,
-  methaneValidityVisibility = { valid: true, invalid: true },
+  methaneValidityVisibility = { valid: true, invalid: true, noData: false },
   onToggleMethaneValidity,
   resultsPageMode,
   heatmapEnabled = true,
@@ -412,9 +414,14 @@ export function Map({
   const popupRef = useRef(null);
   const primaryMarkerRef = useRef(null);
   const plumeTransitionFrameRef = useRef(null);
+  const traceSourceUpdateTimeoutRef = useRef(null);
   const plumeModeFromTiltRef = useRef(plumeViewEnabled);
   const initialTraceDatasetRef = useRef(traceDataset);
-  const initialPlumeDatasetRef = useRef(buildMethanePlumeDataset(traceDataset));
+  const initialPlumeDatasetRef = useRef(
+    resultsPageMode
+      ? buildMethanePlumeDataset(traceDataset)
+      : EMPTY_FEATURE_COLLECTION,
+  );
   const datasetMaxMethane = getTraceMaxMethane(traceDataset);
   const initialUpperLimitRef = useRef(datasetMaxMethane);
   const initialLowerLimitRef = useRef(0);
@@ -427,6 +434,7 @@ export function Map({
   const [lowerLimitInput, setLowerLimitInput] = useState("0");
   const [showFlightPath, setShowFlightPath] = useState(false);
   const [showTargetMarkers, setShowTargetMarkers] = useState(false);
+  const [isAutoCenterEnabled, setIsAutoCenterEnabled] = useState(true);
   const [droneStates, setDroneStates] = useState([]);
   const [droneTrackHistory, setDroneTrackHistory] = useState({});
   const [isTelemetryConnected, setIsTelemetryConnected] = useState(false);
@@ -443,8 +451,11 @@ export function Map({
     ),
   );
   const methanePlumeDataset = useMemo(
-    () => buildMethanePlumeDataset(traceDataset),
-    [traceDataset],
+    () =>
+      resultsPageMode
+        ? buildMethanePlumeDataset(traceDataset)
+        : EMPTY_FEATURE_COLLECTION,
+    [resultsPageMode, traceDataset],
   );
   const visibleDroneIdSet = useMemo(
     () => buildVisibleDroneIdSet(visibleDroneIds),
@@ -608,7 +619,7 @@ export function Map({
 
     map.addControl(new mapboxgl.NavigationControl(), "top-right");
 
-    
+
 
     map.on("load", () => {
       if (!isOnlineMode && !resultsPageMode) {
@@ -999,7 +1010,7 @@ export function Map({
       });
       setShowTargetSwitch(hasValidTarget);
 
-      if (resultsPageMode) {
+      if (resultsPageMode && isAutoCenterEnabled) {
         fitMapToTraceDataset(map, initialTraceDatasetRef.current, {
           padding: 20,
           duration: 0,
@@ -1060,17 +1071,21 @@ export function Map({
       return;
     }
 
+    primaryMarkerRef.current?.setLngLat([
+      displayTargetLongitude,
+      displayTargetLatitude,
+    ]);
+
+    if (!isAutoCenterEnabled) {
+      return;
+    }
+
     if (visibleDroneStates.length > 1) {
       fitMapToDroneStates(currentMap, visibleDroneStates, {
         padding: 80,
         duration: 900,
         maxZoom: 17,
       });
-
-      primaryMarkerRef.current?.setLngLat([
-        displayTargetLongitude,
-        displayTargetLatitude,
-      ]);
       return;
     }
 
@@ -1087,17 +1102,13 @@ export function Map({
       duration: 900,
       essential: true,
     });
-
-    primaryMarkerRef.current?.setLngLat([
-      displayTargetLongitude,
-      displayTargetLatitude,
-    ]);
   }, [
     displayLatitude,
     displayLongitude,
     displayTargetLatitude,
     displayTargetLongitude,
     focusedDrone,
+    isAutoCenterEnabled,
     resultsPageMode,
     visibleDroneStates,
   ]);
@@ -1114,30 +1125,59 @@ export function Map({
   }, [datasetMaxMethane, lowerLimit]);
 
   useEffect(() => {
+    if (traceSourceUpdateTimeoutRef.current) {
+      window.clearTimeout(traceSourceUpdateTimeoutRef.current);
+      traceSourceUpdateTimeoutRef.current = null;
+    }
+
     plumeModeFromTiltRef.current = plumeViewEnabled;
 
     const currentMap = mapRef.current;
-    const methaneSource = currentMap?.getSource("methane-traces");
+    const applySourceUpdate = () => {
+      const activeMap = mapRef.current;
+      const methaneSource = activeMap?.getSource("methane-traces");
 
-    if (methaneSource) {
-      methaneSource.setData(displayedTraceDataset);
+      if (methaneSource) {
+        methaneSource.setData(displayedTraceDataset);
 
-      if (resultsPageMode) {
-        fitMapToTraceDataset(currentMap, displayedTraceDataset, {
-          padding: plumeViewEnabled ? 120 : 20,
-          duration: 500,
-          maxZoom: 18,
-        });
+        if (resultsPageMode && isAutoCenterEnabled) {
+          fitMapToTraceDataset(activeMap, displayedTraceDataset, {
+            padding: plumeViewEnabled ? 120 : 20,
+            duration: 500,
+            maxZoom: 18,
+          });
+        }
       }
+
+      const plumeSource = activeMap?.getSource("methane-plume");
+      if (plumeSource) {
+        plumeSource.setData(methanePlumeDataset);
+      }
+    };
+
+    if (!currentMap) {
+      return;
     }
 
-    const plumeSource = currentMap?.getSource("methane-plume");
-    if (plumeSource) {
-      plumeSource.setData(methanePlumeDataset);
+    if (resultsPageMode) {
+      applySourceUpdate();
+    } else {
+      traceSourceUpdateTimeoutRef.current = window.setTimeout(
+        applySourceUpdate,
+        DASHBOARD_TRACE_SOURCE_UPDATE_DEBOUNCE_MS,
+      );
     }
+
+    return () => {
+      if (traceSourceUpdateTimeoutRef.current) {
+        window.clearTimeout(traceSourceUpdateTimeoutRef.current);
+        traceSourceUpdateTimeoutRef.current = null;
+      }
+    };
   }, [
     displayedTraceDataset,
     methanePlumeDataset,
+    isAutoCenterEnabled,
     resultsPageMode,
     plumeViewEnabled,
   ]);
@@ -1443,7 +1483,7 @@ export function Map({
             return history;
           }, {}),
         );
-      } catch { }
+      } catch { /* empty */ }
     };
 
     const connectTelemetrySocket = () => {
@@ -1596,9 +1636,9 @@ export function Map({
             }`}
         >
           {!resultsPageMode ? (
-            <div className="flex items-center justify-start gap-3 rounded-lg  px-3 py-2"
+            <div className="flex flex-col gap-3 rounded-lg px-3 py-2"
             >
-              <div>
+              <div className="flex flex-col justify-start items-start">
                 <p
                   className="text-xs uppercase tracking-[0.18em]"
                   style={{ color: color.green }}
@@ -1610,66 +1650,124 @@ export function Map({
                   style={{ color: color.text }}
                 >
                   Drone satellite view
+
+                  <div className="flex flex-wrap justify-start items-center gap-3 mt-1">
+                    <div
+                      className="flex items-center gap-2 rounded-full border px-2 py-1"
+                      style={{ borderColor: color.border }}
+                    >
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setIsAutoCenterEnabled((previous) => !previous)
+                        }
+                        className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-300 ease-in-out focus:outline-none ${isAutoCenterEnabled ? "bg-cyan-500" : "bg-gray-300"}`}
+                      >
+                        <span
+                          className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition-transform duration-300 ease-in-out ${isAutoCenterEnabled ? "translate-x-5" : "translate-x-0"}`}
+                        />
+                      </button>
+                      <span className="text-sm" style={{ color: color.textMuted }}>
+                        Center on Drone
+                      </span>
+                    </div>
+
+                    <div
+                      className="flex items-center gap-2 rounded-full border px-2 py-1"
+                      style={{ borderColor: color.border }}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => setShowFlightPath((previous) => !previous)}
+                        className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-300 ease-in-out focus:outline-none ${showFlightPath ? "bg-orange-500" : "bg-gray-300"}`}
+                      >
+                        <span
+                          className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition-transform duration-300 ease-in-out ${showFlightPath ? "translate-x-5" : "translate-x-0"}`}
+                        />
+                      </button>
+                      <span className="text-sm" style={{ color: color.textMuted }}>
+                        Flight Path
+                      </span>
+                    </div>
+
+                    <div
+                      className="flex items-center gap-2 rounded-full border px-2 py-1"
+                      style={{ borderColor: color.border }}
+                    >
+                      <button
+                        type="button"
+                        onClick={() => setShowTargetMarkers((previous) => !previous)}
+                        className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-300 ease-in-out focus:outline-none ${showTargetMarkers ? "bg-yellow-400" : "bg-gray-300"}`}
+                      >
+                        <span
+                          className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition-transform duration-300 ease-in-out ${showTargetMarkers ? "translate-x-5" : "translate-x-0"}`}
+                        />
+                      </button>
+                      <span className="text-sm" style={{ color: color.textMuted }}>
+                        Target Markers
+                      </span>
+                    </div>
+                  </div>
                 </p>
 
               </div>
             </div>
           ) : null}
-          <div className="flex flex-col gap-2 rounded-lg border px-3 py-2 "
+          <div className="flex flex-col gap-2 rounded-lg border px-3 py-2 mt-5 "
             style={{ backgroundColor: color.surface, borderColor: color.border }}
           >
             {!resultsPageMode ? (
               <div className="flex flex-col gap-2">
                 <div className="flex flex-wrap items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => onToggleAllPlottedData?.()}
-                  className="relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-300 ease-in-out focus:outline-none"
-                  style={{
-                    backgroundColor: showAllPlottedData
-                      ? color.green
-                      : color.borderStrong,
-                  }}
-                  aria-label="Toggle all map plotted data"
-                >
-                  <span
-                    className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition-transform duration-300 ease-in-out ${showAllPlottedData ? "translate-x-5" : "translate-x-0"}`}
-                  />
-                </button>
-                <span className="text-sm font-semibold" style={{ color: color.text }}>
-                  Map Data
-                </span>
+                  <button
+                    type="button"
+                    onClick={() => onToggleAllPlottedData?.()}
+                    className="relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-300 ease-in-out focus:outline-none"
+                    style={{
+                      backgroundColor: showAllPlottedData
+                        ? color.green
+                        : color.borderStrong,
+                    }}
+                    aria-label="Toggle all map plotted data"
+                  >
+                    <span
+                      className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition-transform duration-300 ease-in-out ${showAllPlottedData ? "translate-x-5" : "translate-x-0"}`}
+                    />
+                  </button>
+                  <span className="text-sm font-semibold" style={{ color: color.text }}>
+                    Map Data
+                  </span>
 
-                <div className="flex flex-wrap gap-1.5">
-                  {devices.map((device) => {
-                    const isVisible =
-                      showAllPlottedData &&
-                      droneVisibilityById[device.id] !== false;
-                    const deviceColor = getDroneColor(device.id);
+                  <div className="flex flex-wrap gap-1.5">
+                    {devices.map((device) => {
+                      const isVisible =
+                        showAllPlottedData &&
+                        droneVisibilityById[device.id] !== false;
+                      const deviceColor = getDroneColor(device.id);
 
-                    return (
-                      <button
-                        key={device.id}
-                        type="button"
-                        onClick={() => onToggleDroneVisibility?.(device.id)}
-                        className="inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-semibold transition-colors"
-                        style={{
-                          backgroundColor: isVisible
-                            ? `${deviceColor}22`
-                            : color.card,
-                          borderColor: isVisible ? deviceColor : color.border,
-                          color: isVisible ? color.text : color.textMuted,
-                        }}
-                      >
-                        <span
-                          className="h-2 w-2 rounded-full"
-                          style={{ backgroundColor: deviceColor }}
-                        />
-                        {device.name}
-                      </button>
-                    );
-                  })}
-                </div>
+                      return (
+                        <button
+                          key={device.id}
+                          type="button"
+                          onClick={() => onToggleDroneVisibility?.(device.id)}
+                          className="inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-semibold transition-colors"
+                          style={{
+                            backgroundColor: isVisible
+                              ? `${deviceColor}22`
+                              : color.card,
+                            borderColor: isVisible ? deviceColor : color.border,
+                            color: isVisible ? color.text : color.textMuted,
+                          }}
+                        >
+                          <span
+                            className="h-2 w-2 rounded-full"
+                            style={{ backgroundColor: deviceColor }}
+                          />
+                          {device.name}
+                        </button>
+                      );
+                    })}
+                  </div>
                 </div>
 
                 <div className="flex flex-wrap items-center gap-1.5">
@@ -1715,116 +1813,192 @@ export function Map({
                   >
                     Invalid (2)
                   </button>
-                  <span className="text-[11px]" style={{ color: color.textDim }}>
-                    0 = no data (hidden)
-                  </span>
+                  <button
+                    type="button"
+                    onClick={() => onToggleMethaneValidity?.("noData")}
+                    className="inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-semibold transition-colors"
+                    style={{
+                      backgroundColor: methaneValidityVisibility.noData
+                        ? `${color.textMuted}22`
+                        : color.card,
+                      borderColor: methaneValidityVisibility.noData
+                        ? color.textMuted
+                        : color.border,
+                      color: methaneValidityVisibility.noData
+                        ? color.text
+                        : color.textMuted,
+                    }}
+                  >
+                    No Data (0)
+                  </button>
+
                 </div>
               </div>
             ) : null}
 
-            <div className="flex w-full flex-row flex-nowrap items-center justify-between gap-5 whitespace-nowrap pt-1">
+            <div className="flex w-full flex-col gap-2 pt-1">
               {resultsPageMode ? (
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => onToggleHeatmap?.()}
-                    className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-300 ease-in-out focus:outline-none ${heatmapEnabled ? "bg-sky-500" : "bg-gray-300"}`}
+                <div className="flex flex-wrap items-center gap-3">
+                  <div
+                    className="flex items-center gap-2 rounded-full border px-2 py-1"
+                    style={{ borderColor: color.border }}
                   >
-                    <span
-                      className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition-transform duration-300 ease-in-out ${heatmapEnabled ? "translate-x-5" : "translate-x-0"}`}
-                    />
-                  </button>
-                  <span className="text-sm" style={{ color: color.textMuted }}>
-                    Heatmap
-                  </span>
+                    <button
+                      type="button"
+                      onClick={() => onToggleHeatmap?.()}
+                      className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-300 ease-in-out focus:outline-none ${heatmapEnabled ? "bg-sky-500" : "bg-gray-300"}`}
+                    >
+                      <span
+                        className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition-transform duration-300 ease-in-out ${heatmapEnabled ? "translate-x-5" : "translate-x-0"}`}
+                      />
+                    </button>
+                    <span className="text-sm" style={{ color: color.textMuted }}>
+                      Heatmap
+                    </span>
+                  </div>
+
+                  <div
+                    className="flex items-center gap-2 rounded-full border px-2 py-1"
+                    style={{ borderColor: color.border }}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => onTogglePlumeView?.()}
+                      className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-300 ease-in-out focus:outline-none ${plumeViewEnabled ? "bg-green-600" : "bg-gray-300"}`}
+                    >
+                      <span
+                        className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition-transform duration-300 ease-in-out ${plumeViewEnabled ? "translate-x-5" : "translate-x-0"}`}
+                      />
+                    </button>
+                    <span className="text-sm" style={{ color: color.textMuted }}>
+                      Plume View
+                    </span>
+                  </div>
+
+                  <div
+                    className="flex items-center gap-2 rounded-full border px-2 py-1"
+                    style={{ borderColor: color.border }}
+                  >
+                    <span className="text-xs" style={{ color: color.textMuted }}>
+                      Methane Valid
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => onToggleMethaneValidity?.("valid")}
+                      className="rounded-full border px-2.5 py-1 text-xs font-semibold transition-colors"
+                      style={{
+                        backgroundColor: methaneValidityVisibility.valid
+                          ? `${color.green}22`
+                          : color.card,
+                        borderColor: methaneValidityVisibility.valid
+                          ? color.green
+                          : color.border,
+                        color: methaneValidityVisibility.valid
+                          ? color.text
+                          : color.textMuted,
+                      }}
+                    >
+                      1
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onToggleMethaneValidity?.("invalid")}
+                      className="rounded-full border px-2.5 py-1 text-xs font-semibold transition-colors"
+                      style={{
+                        backgroundColor: methaneValidityVisibility.invalid
+                          ? `${color.orange}22`
+                          : color.card,
+                        borderColor: methaneValidityVisibility.invalid
+                          ? color.orange
+                          : color.border,
+                        color: methaneValidityVisibility.invalid
+                          ? color.text
+                          : color.textMuted,
+                      }}
+                    >
+                      2
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onToggleMethaneValidity?.("noData")}
+                      className="rounded-full border px-2.5 py-1 text-xs font-semibold transition-colors"
+                      style={{
+                        backgroundColor: methaneValidityVisibility.noData
+                          ? `${color.textMuted}22`
+                          : color.card,
+                        borderColor: methaneValidityVisibility.noData
+                          ? color.textMuted
+                          : color.border,
+                        color: methaneValidityVisibility.noData
+                          ? color.text
+                          : color.textMuted,
+                      }}
+                    >
+                      0
+                    </button>
+                  </div>
                 </div>
               ) : null}
 
               {resultsPageMode ? (
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => onTogglePlumeView?.()}
-                    className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-300 ease-in-out focus:outline-none ${plumeViewEnabled ? "bg-green-600" : "bg-gray-300"}`}
+                <div className="flex flex-wrap items-center gap-3">
+                  <div
+                    className="flex items-center gap-2 rounded-full border px-2 py-1"
+                    style={{ borderColor: color.border }}
                   >
-                    <span
-                      className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition-transform duration-300 ease-in-out ${plumeViewEnabled ? "translate-x-5" : "translate-x-0"}`}
-                    />
-                  </button>
-                  <span className="text-sm" style={{ color: color.textMuted }}>Plume View</span>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setIsAutoCenterEnabled((previous) => !previous)
+                      }
+                      className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-300 ease-in-out focus:outline-none ${isAutoCenterEnabled ? "bg-cyan-500" : "bg-gray-300"}`}
+                    >
+                      <span
+                        className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition-transform duration-300 ease-in-out ${isAutoCenterEnabled ? "translate-x-5" : "translate-x-0"}`}
+                      />
+                    </button>
+                    <span className="text-sm" style={{ color: color.textMuted }}>
+                      Auto Center
+                    </span>
+                  </div>
+
+                  <div
+                    className="flex items-center gap-2 rounded-full border px-2 py-1"
+                    style={{ borderColor: color.border }}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => setShowFlightPath((previous) => !previous)}
+                      className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-300 ease-in-out focus:outline-none ${showFlightPath ? "bg-orange-500" : "bg-gray-300"}`}
+                    >
+                      <span
+                        className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition-transform duration-300 ease-in-out ${showFlightPath ? "translate-x-5" : "translate-x-0"}`}
+                      />
+                    </button>
+                    <span className="text-sm" style={{ color: color.textMuted }}>
+                      Flight Path
+                    </span>
+                  </div>
+
+                  <div
+                    className="flex items-center gap-2 rounded-full border px-2 py-1"
+                    style={{ borderColor: color.border }}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => setShowTargetMarkers((previous) => !previous)}
+                      className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-300 ease-in-out focus:outline-none ${showTargetMarkers ? "bg-yellow-400" : "bg-gray-300"}`}
+                    >
+                      <span
+                        className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition-transform duration-300 ease-in-out ${showTargetMarkers ? "translate-x-5" : "translate-x-0"}`}
+                      />
+                    </button>
+                    <span className="text-sm" style={{ color: color.textMuted }}>
+                      Target Markers
+                    </span>
+                  </div>
                 </div>
               ) : null}
-
-              {resultsPageMode ? (
-                <div className="flex items-center gap-2">
-                  <span className="text-xs" style={{ color: color.textMuted }}>
-                    Methane Valid
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => onToggleMethaneValidity?.("valid")}
-                    className="rounded-full border px-2.5 py-1 text-xs font-semibold transition-colors"
-                    style={{
-                      backgroundColor: methaneValidityVisibility.valid
-                        ? `${color.green}22`
-                        : color.card,
-                      borderColor: methaneValidityVisibility.valid
-                        ? color.green
-                        : color.border,
-                      color: methaneValidityVisibility.valid
-                        ? color.text
-                        : color.textMuted,
-                    }}
-                  >
-                    1
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => onToggleMethaneValidity?.("invalid")}
-                    className="rounded-full border px-2.5 py-1 text-xs font-semibold transition-colors"
-                    style={{
-                      backgroundColor: methaneValidityVisibility.invalid
-                        ? `${color.orange}22`
-                        : color.card,
-                      borderColor: methaneValidityVisibility.invalid
-                        ? color.orange
-                        : color.border,
-                      color: methaneValidityVisibility.invalid
-                        ? color.text
-                        : color.textMuted,
-                    }}
-                  >
-                    2
-                  </button>
-                </div>
-              ) : null}
-
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => setShowFlightPath((previous) => !previous)}
-                  className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-300 ease-in-out focus:outline-none ${showFlightPath ? "bg-orange-500" : "bg-gray-300"}`}
-                >
-                  <span
-                    className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition-transform duration-300 ease-in-out ${showFlightPath ? "translate-x-5" : "translate-x-0"}`}
-                  />
-                </button>
-                <span className="text-sm" style={{ color: color.textMuted }}>Flight Path</span>
-              </div>
-             
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setShowTargetMarkers((previous) => !previous)}
-                    className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-300 ease-in-out focus:outline-none ${showTargetMarkers ? "bg-yellow-400" : "bg-gray-300"}`}
-                  >
-                    <span
-                      className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition-transform duration-300 ease-in-out ${showTargetMarkers ? "translate-x-5" : "translate-x-0"}`}
-                    />
-                  </button>
-                  <span className="text-sm" style={{ color: color.textMuted }}>Target Markers</span>
-                </div>
-            
             </div>
           </div>
         </div>
