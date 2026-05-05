@@ -333,9 +333,8 @@ const buildTraceDatasetFromFlowData = (datasetFlowData) => ({
   type: "FeatureCollection",
   features: filterCoordinateOutliers(datasetFlowData)
     .filter((point) => {
-      // Only check drone coordinates for validity
       return Number.isFinite(point.latitude) && Number.isFinite(point.longitude);
-    })
+    }).slice(-5000)
     .map((point) => {
       const sourceLatitude = point.latitude;
       const sourceLongitude = point.longitude;
