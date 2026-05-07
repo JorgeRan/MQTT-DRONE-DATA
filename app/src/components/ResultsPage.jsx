@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { color } from "../constants/tailwind";
 import {
   calculateDistanceMeters,
@@ -745,6 +746,9 @@ export function ResultsPage({
   onDataRefresh,
 }) {
   const [selectedMissionId, setSelectedMissionId] = useState(null);
+  const [isMissionLoading, setIsMissionLoading] = useState(false);
+  const [isMissionMapReady, setIsMissionMapReady] = useState(false);
+  const [isMissionChartReady, setIsMissionChartReady] = useState(false);
 
   const [selectedResultDroneId, setSelectedResultDroneId] =
     useState(ALL_DRONES_OPTION);
@@ -786,7 +790,10 @@ export function ResultsPage({
     acetylene: "0.0",
     nitrousOxide: "0.0",
   });
+  const MISSION_RENDER_GUARD_TIMEOUT_MS = 9000;
   const replayTimerRef = useRef(null);
+  const missionSelectionTimeoutRef = useRef(null);
+  const missionRenderGuardTimeoutRef = useRef(null);
   const replayEndIndexRef = useRef(0);
   const analysisWorkerRef = useRef(null);
   const analysisRequestIdRef = useRef(0);
@@ -817,6 +824,68 @@ export function ResultsPage({
     };
     input.click();
   };
+
+  const clearMissionSelectionTransitions = useCallback(() => {
+    if (missionSelectionTimeoutRef.current) {
+      window.clearTimeout(missionSelectionTimeoutRef.current);
+      missionSelectionTimeoutRef.current = null;
+    }
+
+    if (missionRenderGuardTimeoutRef.current) {
+      window.clearTimeout(missionRenderGuardTimeoutRef.current);
+      missionRenderGuardTimeoutRef.current = null;
+    }
+  }, []);
+
+  const handleMapTraceRenderComplete = useCallback(() => {
+    setIsMissionMapReady(true);
+  }, [clearMissionSelectionTransitions]);
+
+  const handleChartRenderComplete = useCallback(() => {
+    setIsMissionChartReady(true);
+  }, []);
+
+  const handleSelectMission = useCallback(
+    (mission) => {
+      if (!mission?.id) {
+        return;
+      }
+
+      const shouldSkipTransition =
+        selectedMissionId === mission.id && !isMissionLoading;
+      if (shouldSkipTransition) {
+        setSelectedResultDroneId(ALL_DRONES_OPTION);
+        onSelectDevice?.(mission.primaryDroneId || selectedDeviceId);
+        return;
+      }
+
+      clearMissionSelectionTransitions();
+      flushSync(() => {
+        setIsMissionLoading(true);
+        setIsMissionMapReady(false);
+        setIsMissionChartReady(false);
+      });
+
+      missionSelectionTimeoutRef.current = window.setTimeout(() => {
+        setSelectedResultDroneId(ALL_DRONES_OPTION);
+        onSelectDevice?.(mission.primaryDroneId || selectedDeviceId);
+        setSelectedMissionId(mission.id);
+        missionSelectionTimeoutRef.current = null;
+
+        missionRenderGuardTimeoutRef.current = window.setTimeout(() => {
+          setIsMissionLoading(false);
+          missionRenderGuardTimeoutRef.current = null;
+        }, MISSION_RENDER_GUARD_TIMEOUT_MS);
+      }, 0);
+    },
+    [
+      clearMissionSelectionTransitions,
+      isMissionLoading,
+      onSelectDevice,
+      selectedDeviceId,
+      selectedMissionId,
+    ],
+  );
 
   const actualMissions = useMemo(() => {
     return missionsSample
@@ -942,10 +1011,22 @@ export function ResultsPage({
       (mission) => mission.id === selectedMissionId,
     );
 
-    if (!selectedMissionStillExists) {
-      setSelectedMissionId(ALL_DATA_MISSION_ID);
+    if (selectedMissionId && !selectedMissionStillExists) {
+      setSelectedMissionId(null);
+      setIsMissionLoading(false);
+    }
+
+    if (!selectedMissionId) {
+      setIsMissionLoading(false);
     }
   }, [missions, selectedMissionId]);
+
+  useEffect(
+    () => () => {
+      clearMissionSelectionTransitions();
+    },
+    [clearMissionSelectionTransitions],
+  );
 
   const aggregateMission = useMemo(
     () => missions.find((mission) => mission.id === ALL_DATA_MISSION_ID) || null,
@@ -1047,6 +1128,52 @@ export function ResultsPage({
       ),
     [selectedFlowData],
   );
+
+  const requiresChartReady = useMemo(() => {
+    if (!selectedMission || selectedFlowData.length === 0) {
+      return false;
+    }
+
+    if (selectedSensorMode === SENSOR_MODE_AERIS) {
+      return hasAerisTraceData;
+    }
+
+    if (selectedSensorMode === SENSOR_MODE_MIXED) {
+      return hasDualTraceData || hasAerisTraceData;
+    }
+
+    return true;
+  }, [
+    hasAerisTraceData,
+    hasDualTraceData,
+    selectedFlowData.length,
+    selectedMission,
+    selectedSensorMode,
+  ]);
+
+  useEffect(() => {
+    if (!isMissionLoading || !selectedMission) {
+      return;
+    }
+
+    if (!isMissionMapReady) {
+      return;
+    }
+
+    if (requiresChartReady && !isMissionChartReady) {
+      return;
+    }
+
+    clearMissionSelectionTransitions();
+    setIsMissionLoading(false);
+  }, [
+    clearMissionSelectionTransitions,
+    isMissionChartReady,
+    isMissionLoading,
+    isMissionMapReady,
+    requiresChartReady,
+    selectedMission,
+  ]);
 
   const maxSelectablePpm = Math.max(1, getTelemetryPeakValue(selectedFlowData));
   const [selectedWindow, setSelectedWindow] = useState({
@@ -1419,7 +1546,8 @@ export function ResultsPage({
       setMissionsSample([]);
       setTelemetryHistorySample([]);
       setTelemetryHistoryRange({ from: "", to: "" });
-      setSelectedMissionId(ALL_DATA_MISSION_ID);
+      setSelectedMissionId(null);
+      setIsMissionLoading(false);
       setSelectedResultDroneId(ALL_DRONES_OPTION);
       setImportMessage("All recorded data deleted.");
       if (typeof onDataRefresh === "function") {
@@ -1825,11 +1953,7 @@ export function ResultsPage({
                   <button
                     type="button"
                     onClick={() => {
-                      setSelectedMissionId(mission.id);
-                      setSelectedResultDroneId(ALL_DRONES_OPTION);
-                      onSelectDevice?.(
-                        mission.primaryDroneId || selectedDeviceId,
-                      );
+                      handleSelectMission(mission);
                     }}
                     className="relative z-10 flex w-full flex-row rounded-md border px-3 py-2 text-left"
                     style={{
@@ -2059,15 +2183,11 @@ export function ResultsPage({
                     role="button"
                     tabIndex={0}
                     onClick={() => {
-                      setSelectedMissionId(mission.id);
-                      setSelectedResultDroneId(ALL_DRONES_OPTION);
-                      onSelectDevice?.(mission.primaryDroneId || selectedDeviceId);
+                      handleSelectMission(mission);
                     }}
                     onKeyPress={(e) => {
                       if (e.key === "Enter" || e.key === " ") {
-                        setSelectedMissionId(mission.id);
-                        setSelectedResultDroneId(ALL_DRONES_OPTION);
-                        onSelectDevice?.(mission.primaryDroneId || selectedDeviceId);
+                        handleSelectMission(mission);
                       }
                     }}
                     className="relative z-10 flex w-full flex-row rounded-md border px-3 py-2 text-left cursor-pointer"
@@ -2366,6 +2486,7 @@ export function ResultsPage({
               <div className="relative">
                 <select
                   value={selectedResultDroneId}
+                  disabled={isMissionLoading || !selectedMission}
                   onChange={(e) => {
                     const nextDroneId = e.target.value;
                     setSelectedResultDroneId(nextDroneId);
@@ -2414,10 +2535,18 @@ export function ResultsPage({
                   onClick={playFlight}
                   type="button"
                   className="rounded px-2 py-1"
-                  disabled={!selectedFlowData.length || isReplayPlaying}
+                  disabled={
+                    isMissionLoading ||
+                    !selectedFlowData.length ||
+                    isReplayPlaying
+                  }
                   style={{
                     opacity:
-                      !selectedFlowData.length || isReplayPlaying ? 0.55 : 1,
+                      isMissionLoading ||
+                      !selectedFlowData.length ||
+                      isReplayPlaying
+                        ? 0.55
+                        : 1,
                   }}
                 >
                   {replayEndIndexRef.current >=
@@ -2431,9 +2560,9 @@ export function ResultsPage({
                   onClick={pauseFlight}
                   type="button"
                   className="rounded px-2 py-1"
-                  disabled={!isReplayPlaying}
+                  disabled={isMissionLoading || !isReplayPlaying}
                   style={{
-                    opacity: isReplayPlaying ? 1 : 0.55,
+                    opacity: isMissionLoading ? 0.55 : isReplayPlaying ? 1 : 0.55,
                   }}
                 >
                   <Pause size={20} />
@@ -2441,9 +2570,10 @@ export function ResultsPage({
                 <button
                   type="button"
                   className="rounded px-2 py-1"
-                  disabled={!selectedFlowData.length}
+                  disabled={isMissionLoading || !selectedFlowData.length}
                   style={{
-                    opacity: selectedFlowData.length ? 1 : 0.55,
+                    opacity:
+                      isMissionLoading || !selectedFlowData.length ? 0.55 : 1,
                   }}
                   onClick={resetFlight}
                 >
@@ -2453,64 +2583,108 @@ export function ResultsPage({
             </div>
 
             <div className="overflow-hidden rounded-md">
-              <Map
-                traceDataset={filteredTraceDataset}
-                onScaleChange={setLegendScale}
-                selectedDroneId={
-                  selectedResultDroneId === ALL_DRONES_OPTION
-                    ? selectedMission?.primaryDroneId || selectedDeviceId
-                    : selectedResultDroneId
-                }
-                resultsPageMode={true}
-                heatmapEnabled={isHeatmapEnabled}
-                plumeViewEnabled={isPlumeViewEnabled}
-                traceOpacity={traceOpacity}
-                showMethaneValidityControls={!isAerisAnalysis}
-                methaneValidityVisibility={methaneValidityVisibility}
-                onToggleMethaneValidity={
-                  handleToggleMethaneValidityVisibility
-                }
-                onToggleHeatmap={() => {
-                  if (!selectedMissionId) {
-                    return;
-                  }
-
-                  setHeatmapViewByMission((previous) => ({
-                    ...previous,
-                    [selectedMissionId]: !(previous[selectedMissionId] ?? true),
-                  }));
-                }}
-                onTogglePlumeView={() => {
-                  if (!selectedMissionId) {
-                    return;
-                  }
-
-                  setPlumeViewByMission((previous) => ({
-                    ...previous,
-                    [selectedMissionId]: !(previous[selectedMissionId] ?? false),
-                  }));
-                }}
-                onPlumeViewAutoChange={(enabled) => {
-                  if (!selectedMissionId) {
-                    return;
-                  }
-
-                  setPlumeViewByMission((previous) => {
-                    if ((previous[selectedMissionId] ?? false) === enabled) {
-                      return previous;
+              {selectedMission ? (
+                <div className="relative">
+                  <Map
+                    traceDataset={filteredTraceDataset}
+                    onScaleChange={setLegendScale}
+                    selectedDroneId={
+                      selectedResultDroneId === ALL_DRONES_OPTION
+                        ? selectedMission?.primaryDroneId || selectedDeviceId
+                        : selectedResultDroneId
                     }
+                    resultsPageMode={true}
+                    heatmapEnabled={isHeatmapEnabled}
+                    plumeViewEnabled={isPlumeViewEnabled}
+                    traceOpacity={traceOpacity}
+                    showMethaneValidityControls={!isAerisAnalysis}
+                    methaneValidityVisibility={methaneValidityVisibility}
+                    onToggleMethaneValidity={
+                      handleToggleMethaneValidityVisibility
+                    }
+                    onToggleHeatmap={() => {
+                      if (!selectedMissionId) {
+                        return;
+                      }
 
-                    return {
-                      ...previous,
-                      [selectedMissionId]: enabled,
-                    };
-                  });
-                }}
-                missionConfiguration={
-                  sensorsMode}
-              />
+                      setHeatmapViewByMission((previous) => ({
+                        ...previous,
+                        [selectedMissionId]: !(previous[selectedMissionId] ?? true),
+                      }));
+                    }}
+                    onTogglePlumeView={() => {
+                      if (!selectedMissionId) {
+                        return;
+                      }
+
+                      setPlumeViewByMission((previous) => ({
+                        ...previous,
+                        [selectedMissionId]: !(previous[selectedMissionId] ?? false),
+                      }));
+                    }}
+                    onPlumeViewAutoChange={(enabled) => {
+                      if (!selectedMissionId) {
+                        return;
+                      }
+
+                      setPlumeViewByMission((previous) => {
+                        if ((previous[selectedMissionId] ?? false) === enabled) {
+                          return previous;
+                        }
+
+                        return {
+                          ...previous,
+                          [selectedMissionId]: enabled,
+                        };
+                      });
+                    }}
+                    onTraceRenderComplete={handleMapTraceRenderComplete}
+                    missionConfiguration={sensorsMode}
+                  />
+
+                  {isMissionLoading ? (
+                    <div
+                      className="absolute inset-0 z-20 flex min-h-[320px] flex-col items-center justify-center gap-3 rounded-md border px-4 text-center"
+                      style={{
+                        backgroundColor: "rgba(14, 18, 26, 0.78)",
+                        borderColor: color.border,
+                        color: color.textMuted,
+                      }}
+                    >
+                      <div
+                        className="h-8 w-8 animate-spin rounded-full border-2 border-t-transparent"
+                        style={{
+                          borderColor: color.orange,
+                          borderTopColor: "transparent",
+                        }}
+                      />
+                      <div>
+                        <p className="text-sm font-semibold" style={{ color: color.text }}>
+                          Loading mission data...
+                        </p>
+                        <p className="text-xs" style={{ color: color.textMuted }}>
+                          Rendering map colors and values.
+                        </p>
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+              ) : (
+                <div
+                  className="flex min-h-[320px] items-center justify-center rounded-md border px-4 text-center"
+                  style={{
+                    backgroundColor: color.surface,
+                    borderColor: color.border,
+                    color: color.textMuted,
+                  }}
+                >
+                  Please select a mission to analyse
+                </div>
+              )}
             </div>
-            <OpacityAdjuster value={traceOpacity} onChange={setTraceOpacity} />
+            {isMissionLoading ? null : (
+              <OpacityAdjuster value={traceOpacity} onChange={setTraceOpacity} />
+            )}
 
             <div
               className="mt-3 grid grid-cols-3 gap-2 text-xs"
@@ -2584,7 +2758,25 @@ export function ResultsPage({
           </div>
 
           <div className="grid gap-3 h-full">
-            {isDualSensorAnalysis ? (
+            {isMissionLoading ? (
+              <div
+                className="min-h-[200px] rounded-lg border p-4"
+                style={{ backgroundColor: color.card, borderColor: color.border }}
+              >
+                <div className="flex h-full min-h-[200px] items-center justify-center">
+                  <div className="flex items-center gap-3" style={{ color: color.textMuted }}>
+                    <div
+                      className="h-6 w-6 animate-spin rounded-full border-2 border-t-transparent"
+                      style={{
+                        borderColor: color.orange,
+                        borderTopColor: "transparent",
+                      }}
+                    />
+                    <span className="text-sm">Loading analysis panels...</span>
+                  </div>
+                </div>
+              </div>
+            ) : isDualSensorAnalysis ? (
               <div
                 className="min-h-[150px] rounded-lg border p-3"
                 style={{ backgroundColor: color.card, borderColor: color.border }}
@@ -2639,7 +2831,7 @@ export function ResultsPage({
             ) : null}
 
             <div
-              className="min-h-[280px] rounded-lg border p-3"
+              className="relative min-h-[280px] rounded-lg border p-3"
               style={{ backgroundColor: color.card, borderColor: color.border }}
             >
               <h4
@@ -2659,6 +2851,7 @@ export function ResultsPage({
                         selection={selectedWindow}
                         onSelectionChange={setSelectedWindow}
                         resultsPageMode={true}
+                        onRenderComplete={handleChartRenderComplete}
                       />
                     ) : null}
                   </div>
@@ -2668,11 +2861,30 @@ export function ResultsPage({
                     selection={selectedWindow}
                     onSelectionChange={setSelectedWindow}
                     resultsPageMode={true}
+                    onRenderComplete={handleChartRenderComplete}
                   />
                 )}
               </div>
+              {isMissionLoading && requiresChartReady ? (
+                <div
+                  className="absolute inset-0 z-20 flex items-center justify-center rounded-lg"
+                  style={{ backgroundColor: "rgba(14, 18, 26, 0.72)" }}
+                >
+                  <div className="flex items-center gap-3" style={{ color: color.textMuted }}>
+                    <div
+                      className="h-6 w-6 animate-spin rounded-full border-2 border-t-transparent"
+                      style={{
+                        borderColor: color.orange,
+                        borderTopColor: "transparent",
+                      }}
+                    />
+                    <span className="text-sm">Waiting for chart layout...</span>
+                  </div>
+                </div>
+              ) : null}
             </div>
 
+            {isMissionLoading ? null : (
             <div
               className="min-h-[120px]  rounded-lg border p-3"
               style={{
@@ -2760,6 +2972,7 @@ export function ResultsPage({
                 </button>
               </div>
             </div>
+            )}
           </div>
         </div>
         <div className="mt-2 h-full">
@@ -2769,6 +2982,7 @@ export function ResultsPage({
               selection={selectedWindow}
               onSelectionChange={setSelectedWindow}
               resultsPageMode={true}
+              onRenderComplete={handleChartRenderComplete}
               initialTracerRates={analysisTracerRates}
               tracerAvailability={aerisTracerAvailability}
               onAnalyze={(tracerRates) => {
@@ -2784,6 +2998,7 @@ export function ResultsPage({
                   selection={selectedWindow}
                   onSelectionChange={setSelectedWindow}
                   resultsPageMode={true}
+                  onRenderComplete={handleChartRenderComplete}
                   initialTracerRates={analysisTracerRates}
                   tracerAvailability={aerisTracerAvailability}
                   onAnalyze={(tracerRates) => {

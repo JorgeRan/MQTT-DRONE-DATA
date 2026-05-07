@@ -102,8 +102,9 @@ function clampSelection(selection, dataLength, maxPpm) {
   };
 }
 
-export function FlowChart({ flowData, selection, onSelectionChange, resultsPageMode}) {
+export function FlowChart({ flowData, selection, onSelectionChange, resultsPageMode, onRenderComplete }) {
   const chartId = useId().replace(/:/g, "");
+  const chartContainerRef = useRef(null);
   const navigatorRef = useRef(null);
   const ppmRangeRef = useRef(null);
   const dragHandleRef = useRef(null);
@@ -140,9 +141,13 @@ export function FlowChart({ flowData, selection, onSelectionChange, resultsPageM
       Math.max(max, Number(point?.purway) || 0, Number(point?.methane) || 0),
     0,
   );
-  const rightAxisPeakValue = Math.max(
-    1,
-    ...rightAxisData.map((point) => point.sniffer),
+  // const rightAxisPeakValue = Math.max(
+  //   1,
+  //   ...rightAxisData.map((point) => point.sniffer),
+  // );
+  const rightAxisPeakValue = (Array.isArray(rightAxisData) ? rightAxisData : []).reduce(
+    (max, point) => Math.max(max, Number(point?.sniffer) || 0),
+    0,
   );
   const filteredData = useMemo(
     () =>
@@ -274,6 +279,43 @@ export function FlowChart({ flowData, selection, onSelectionChange, resultsPageM
     leftAxisPeakValue,
     maxIndex,
     onSelectionChange,
+    safeSelection,
+  ]);
+
+  useEffect(() => {
+    if (!resultsPageMode || typeof onRenderComplete !== "function") {
+      return undefined;
+    }
+
+    let cancelled = false;
+    let firstFrame = 0;
+    let secondFrame = 0;
+
+    firstFrame = window.requestAnimationFrame(() => {
+      window.dispatchEvent(new Event("resize"));
+
+      secondFrame = window.requestAnimationFrame(() => {
+        if (cancelled || !chartContainerRef.current) {
+          return;
+        }
+
+        onRenderComplete();
+      });
+    });
+
+    return () => {
+      cancelled = true;
+      if (firstFrame) {
+        window.cancelAnimationFrame(firstFrame);
+      }
+      if (secondFrame) {
+        window.cancelAnimationFrame(secondFrame);
+      }
+    };
+  }, [
+    dataLength,
+    onRenderComplete,
+    resultsPageMode,
     safeSelection.endIndex,
     safeSelection.ppmMax,
     safeSelection.ppmMin,
@@ -335,7 +377,7 @@ export function FlowChart({ flowData, selection, onSelectionChange, resultsPageM
   };
 
   return (
-    <div className="flex h-full w-full flex-col gap-3">
+    <div ref={chartContainerRef} className="flex h-full w-full flex-col gap-3">
       {!resultsPageMode ? 
       <div className="flex items-start justify-between gap-3">
         <div>

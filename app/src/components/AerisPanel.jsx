@@ -128,12 +128,14 @@ export function AerisPanel({
   selection,
   onSelectionChange,
   resultsPageMode,
+  onRenderComplete,
   onAnalyze,
   analyzeBusy = false,
   initialTracerRates,
   tracerAvailability,
 }) {
   const chartId = useId().replace(/:/g, "");
+  const chartContainerRef = useRef(null);
   const navigatorRef = useRef(null);
   const ppmRangeRef = useRef(null);
   const dragHandleRef = useRef(null);
@@ -205,6 +207,46 @@ export function AerisPanel({
     setAcetyleneTracerRate(initialTracerRates?.acetylene ?? "");
     setNitrousOxideTracerRate(initialTracerRates?.nitrousOxide ?? "");
   }, [initialTracerRates?.acetylene, initialTracerRates?.nitrousOxide]);
+
+  useEffect(() => {
+    if (!resultsPageMode || typeof onRenderComplete !== "function") {
+      return undefined;
+    }
+
+    let cancelled = false;
+    let firstFrame = 0;
+    let secondFrame = 0;
+
+    firstFrame = window.requestAnimationFrame(() => {
+      window.dispatchEvent(new Event("resize"));
+
+      secondFrame = window.requestAnimationFrame(() => {
+        if (cancelled || !chartContainerRef.current) {
+          return;
+        }
+
+        onRenderComplete();
+      });
+    });
+
+    return () => {
+      cancelled = true;
+      if (firstFrame) {
+        window.cancelAnimationFrame(firstFrame);
+      }
+      if (secondFrame) {
+        window.cancelAnimationFrame(secondFrame);
+      }
+    };
+  }, [
+    dataLength,
+    onRenderComplete,
+    resultsPageMode,
+    safeSelection.endIndex,
+    safeSelection.ppmMax,
+    safeSelection.ppmMin,
+    safeSelection.startIndex,
+  ]);
 
   useEffect(() => {
     const minimumPpmBand = Math.min(
@@ -364,6 +406,7 @@ export function AerisPanel({
 
   return (
     <div
+      ref={chartContainerRef}
       className="flex h-full w-full flex-col gap-3 p-3 rounded-lg"
       style={{ backgroundColor: color.card }}
     >

@@ -352,6 +352,44 @@ const fitMapToTraceDataset = (
   });
 };
 
+const getTraceDatasetCenter = (dataset, fallback = {}) => {
+  const features = Array.isArray(dataset?.features) ? dataset.features : [];
+
+  if (!features.length) {
+    return {
+      latitude: fallback.latitude ?? latitude,
+      longitude: fallback.longitude ?? longitude,
+    };
+  }
+
+  const bounds = new mapboxgl.LngLatBounds();
+  let hasValidPoints = false;
+
+  features.forEach((feature) => {
+    const coordinates = feature?.geometry?.coordinates;
+    const lng = Number(coordinates?.[0]);
+    const lat = Number(coordinates?.[1]);
+
+    if (Number.isFinite(lng) && Number.isFinite(lat)) {
+      bounds.extend([lng, lat]);
+      hasValidPoints = true;
+    }
+  });
+
+  if (!hasValidPoints) {
+    return {
+      latitude: fallback.latitude ?? latitude,
+      longitude: fallback.longitude ?? longitude,
+    };
+  }
+
+  const center = bounds.getCenter();
+  return {
+    latitude: center.lat,
+    longitude: center.lng,
+  };
+};
+
 const fitMapToDroneStates = (
   map,
   drones,
@@ -407,6 +445,7 @@ export function Map({
   onToggleHeatmap,
   onTogglePlumeView,
   onPlumeViewAutoChange,
+  onTraceRenderComplete,
   missionConfiguration,
 }) {
   const mapContainerRef = useRef(null);
@@ -532,6 +571,14 @@ export function Map({
   const displayTargetLongitude = Number.isFinite(focusedDrone?.target_longitude)
     ? focusedDrone.target_longitude
     : longitude;
+  const initialTraceCenter = useMemo(
+    () =>
+      getTraceDatasetCenter(traceDataset, {
+        latitude: displayLatitude,
+        longitude: displayLongitude,
+      }),
+    [displayLatitude, displayLongitude, traceDataset],
+  );
 
   const handleLimitChange = (limitType, rawValue) => {
     const nextValue = rawValue.replace(",", ".");
@@ -584,9 +631,15 @@ export function Map({
     }
 
     const isOnlineMode = shouldUseOnlineMap(mapboxToken);
+    const initialCenterLatitude = resultsPageMode
+      ? initialTraceCenter.latitude
+      : displayLatitude;
+    const initialCenterLongitude = resultsPageMode
+      ? initialTraceCenter.longitude
+      : displayLongitude;
     const offlineCoordinates = buildOfflineImageCoordinates({
-      centerLat: latitude,
-      centerLon: longitude,
+      centerLat: initialCenterLatitude,
+      centerLon: initialCenterLongitude,
     });
 
     if (isOnlineMode) {
@@ -601,7 +654,7 @@ export function Map({
           imageUrl: satelliteImage,
           coordinates: offlineCoordinates,
         }),
-      center: [displayLongitude, displayLatitude],
+      center: [initialCenterLongitude, initialCenterLatitude],
       zoom: 18,
       pitch: 0,
       bearing: 0,
@@ -1136,6 +1189,35 @@ export function Map({
     const applySourceUpdate = () => {
       const activeMap = mapRef.current;
       const methaneSource = activeMap?.getSource("methane-traces");
+      const notifyTraceRenderComplete = () => {
+        if (!resultsPageMode || typeof onTraceRenderComplete !== "function") {
+          return;
+        }
+
+        if (!activeMap) {
+          onTraceRenderComplete();
+          return;
+        }
+
+        let callbackInvoked = false;
+        const invokeOnce = () => {
+          if (callbackInvoked) {
+            return;
+          }
+
+          callbackInvoked = true;
+          onTraceRenderComplete();
+        };
+
+        activeMap.resize();
+        activeMap.triggerRepaint?.();
+        window.requestAnimationFrame(() => {
+          activeMap.resize();
+          activeMap.triggerRepaint?.();
+        });
+
+        activeMap.once("idle", invokeOnce);
+      };
 
       if (methaneSource) {
         methaneSource.setData(displayedTraceDataset);
@@ -1147,6 +1229,10 @@ export function Map({
             maxZoom: 18,
           });
         }
+
+        notifyTraceRenderComplete();
+      } else {
+        notifyTraceRenderComplete();
       }
 
       const plumeSource = activeMap?.getSource("methane-plume");
@@ -1178,6 +1264,7 @@ export function Map({
     displayedTraceDataset,
     methanePlumeDataset,
     isAutoCenterEnabled,
+    onTraceRenderComplete,
     resultsPageMode,
     plumeViewEnabled,
   ]);
