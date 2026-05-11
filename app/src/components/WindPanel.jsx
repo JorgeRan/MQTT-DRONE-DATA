@@ -30,7 +30,7 @@ export function WindPanel({ windSamples = [] }) {
       Math.sqrt((u ?? 0) * (u ?? 0) + (v ?? 0) * (v ?? 0)),
     );
     const direction = validWindSamples.map(({ u, v }) => {
-      return (Math.atan2(-u, -v) * 180 / Math.PI + 360) % 360;
+      return (Math.atan2(u, v) * 180 / Math.PI + 360) % 360;
     });
 
     const rose = calculateWindRose({ direction, speed });
