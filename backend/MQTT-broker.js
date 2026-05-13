@@ -278,8 +278,8 @@ function parseAerisLine(line) {
   return result;
 }
 
-app.use(express.json({ limit: "100mb" }));
-app.use(express.urlencoded({ extended: true, limit: "100mb" }));
+app.use(express.json({ limit: "500mb" }));
+app.use(express.urlencoded({ extended: true, limit: "500mb" }));
 app.post("/api/serial-port", (req, res) => {
   const { port, baudRate } = req.body || {};
   if (!port) return res.status(400).json({ error: "Missing port" });
@@ -714,8 +714,6 @@ app.use((req, res, next) => {
   }
   next();
 });
-
-app.use(express.json({ limit: "100mb" }));
 
 const initializeDatabase = async () => {
   await sql.unsafe(`
@@ -1855,7 +1853,7 @@ const startInternetChecker = async () => {
 };
 
 
-// --- Batch-based session logic ---
+
 let currentSessionId = null;
 let currentSessionCount = 0;
 let currentSessionFirstTime = null;
@@ -1863,15 +1861,12 @@ let currentSessionLastTime = null;
 const SESSION_BATCH_SIZE = 10000;
 
 function generateSessionId() {
-  // Use ISO timestamp and random suffix for uniqueness
   return `session_${new Date().toISOString().replace(/[-:.TZ]/g, "")}_${Math.floor(Math.random()*100000)}`;
 }
 
 const upsertTelemetry = async (telemetry) => {
-  // Start new session if needed
   if (!currentSessionId || currentSessionCount >= SESSION_BATCH_SIZE) {
     if (currentSessionId && currentSessionCount > 0) {
-      // Save previous session metadata
       await sql.unsafe(
         `INSERT OR REPLACE INTO telemetry_sessions (session_id, first_sample_time, last_sample_time, sample_count) VALUES (?, ?, ?, ?)`,
         [currentSessionId, currentSessionFirstTime, currentSessionLastTime, currentSessionCount]
@@ -1883,12 +1878,10 @@ const upsertTelemetry = async (telemetry) => {
     currentSessionLastTime = null;
   }
 
-  // Track first/last sample time
   const tsString = typeof telemetry.ts === "string" ? telemetry.ts : (telemetry.ts?.toISOString?.() || String(telemetry.ts));
   if (!currentSessionFirstTime || tsString < currentSessionFirstTime) currentSessionFirstTime = tsString;
   if (!currentSessionLastTime || tsString > currentSessionLastTime) currentSessionLastTime = tsString;
 
-  // Add session info to telemetry
   telemetry.session_id = currentSessionId;
   telemetry.session_first_sample_time = currentSessionFirstTime;
   telemetry.session_last_sample_time = currentSessionLastTime;

@@ -306,15 +306,15 @@ const getTraceMaxMethane = (dataset) => {
     return 5;
   }
 
-  const values = dataset.features
-    .map((feature) => Number(feature?.properties?.methane))
-    .filter((value) => Number.isFinite(value));
-
-  if (!values.length) {
-    return 5;
+  let max = 5;
+  for (const feature of dataset.features) {
+    const value = Number(feature?.properties?.methane);
+    if (Number.isFinite(value) && value > max) {
+      max = value;
+    }
   }
 
-  return Math.max(5, ...values);
+  return max;
 };
 
 const fitMapToTraceDataset = (

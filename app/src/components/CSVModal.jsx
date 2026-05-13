@@ -327,13 +327,27 @@ const parseStandardCsvToMissionResults = (
   const lonIdx = idx("rtk_lon", "longitude", "lon", "lng", "center_lon", "gimbal_lon", "ref_lon");
   const altIdx = idx("rtk_hfsl", "altitude", "alt", "center_hfsl", "gimbal_hfsl", "ref_hfsl");
   const distIdx = idx("distance");
-  const targetLatIdx = idx("dest_latitude", "target_latitude", "targ_lat", "targ_ref_lat", "Targ Lat [deg]");
-  const targetLonIdx = idx("dest_longitude", "target_longitude", "targ_lon", "targ_ref_lon", "Targ Lon [deg]");
+  const targetLatIdx = idx(
+    "dest_latitude",
+    "target_latitude",
+    "targ_latitude",
+    "targ_lat",
+    "targ_ref_lat",
+    "Targ Lat [deg]",
+  );
+  const targetLonIdx = idx(
+    "dest_longitude",
+    "target_longitude",
+    "targ_longitude",
+    "targ_lon",
+    "targ_ref_lon",
+    "Targ Lon [deg]",
+  );
   const speedIdx = idx("speed", "spd", "ground_speed", "windc_vel");
-  const windUIdx = idx("wind_u", "u_wind", "u");
-  const windVIdx = idx("wind_v", "v_wind", "v");
-  const windWIdx = idx("wind_w", "w_wind", "w");
-  const droneIdx = idx("drone", "drone_id", "droneid");
+  const windUIdx = idx("wind_u", "wind_x", "u_wind", "u");
+  const windVIdx = idx("wind_v", "wind_y", "v_wind", "v");
+  const windWIdx = idx("wind_w", "wind_z", "w_wind", "w");
+  const droneIdx = idx("drone", "drone_name", "drone_id", "droneid");
   const sensorModeIdx = idx("sensor_mode", "sensor_type", "sensor");
 
   if (timeIdx === -1 && (gpsDateIdx === -1 || gpsTimeIdx === -1)) return null;
