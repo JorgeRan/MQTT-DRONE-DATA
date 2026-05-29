@@ -6,7 +6,7 @@ dotenv.config();
 const brokerUrl = process.env.MQTT_BROKER_URL || 'mqtts://1ff7f31f358d46628258e87380e60321.s1.eu.hivemq.cloud:8883';
 const mqttUsername = process.env.MQTT_USERNAME || 'EERL-MQTT';
 const mqttPassword = process.env.MQTT_PASSWORD || 'CH4Drone';
-const publishIntervalMs = Number(process.env.SIM_INTERVAL_MS || 2000);
+const publishIntervalMs = Number(process.env.SIM_INTERVAL_MS || 100);
 const simulatorVerbose = process.env.SIM_VERBOSE === 'true';
 const summaryEveryTicks = Math.max(1, Number(process.env.SIM_LOG_EVERY_TICKS || 5));
 
@@ -19,27 +19,27 @@ const seeds = [
     {
         droneId: 'M350',
         topic: topics[0] || 'M350/data',
-        lat: 35.1970,
-        lon: -97.4458,
+        lat: 45.391050,
+        lon: -75.696960,
         altitude: 35,
         heading: 0,
     },
-    {
-        droneId: 'M400-1',
-        topic: topics[1] || topics[0] || 'M400-1/data',
-        lat: 35.1974,
-        lon: -97.4453,
-        altitude: 42,
-        heading: 120,
-    },
-    {
-        droneId: 'M400-2',
-        topic: topics[2] || topics[1] || topics[0] || 'M400-2/data',
-        lat: 35.1978,
-        lon: -97.4449,
-        altitude: 48,
-        heading: 240,
-    },
+    // {
+    //     droneId: 'M400-1',
+    //     topic: topics[1] || topics[0] || 'M400-1/data',
+    //     lat: 45.391434,
+    //     lon: -75.697314,
+    //     altitude: 42,
+    //     heading: 120,
+    // },
+    // {
+    //     droneId: 'M400-2',
+    //     topic: topics[2] || topics[1] || topics[0] || 'M400-2/data',
+    //     lat: 45.391863,
+    //     lon: -75.696469,
+    //     altitude: 48,
+    //     heading: 240,
+    // },
 ];
 
 const drones = seeds.map((seed) => ({
@@ -63,7 +63,7 @@ let publishedCount = 0;
 const jitter = (magnitude) => (Math.random() - 0.5) * magnitude;
 
 const updateDrone = (drone) => {
-    drone.heading = (drone.heading + 8 + jitter(3)) % 360;
+    drone.heading = (drone.heading + 1 + jitter(10)) % 720;
     const radians = (drone.heading * Math.PI) / 180;
 
     drone.sniffer_ppm = Math.max(0, 1.2 + Math.sin(Date.now() / 3500 + radians) * 0.8 + jitter(0.2));
@@ -87,14 +87,39 @@ const publishTick = () => {
         const payload = {
             timestamp: new Date().toISOString(),
             simulator: true,
+            flight_status: 2,
+            droneId: drone.droneId,
+            drone_id: drone.droneId,
+            topic: drone.topic,
+            distance: 0,
             latitude: Number(drone.lat.toFixed(7)),
             longitude: Number(drone.lon.toFixed(7)),
             altitude: Number(drone.altitude.toFixed(1)),
+            methane: Number(drone.sniffer_ppm.toFixed(3)),
             sniffer_ppm: Number(drone.sniffer_ppm.toFixed(3)),
             purway_ppn: Number(drone.purway_ppn.toFixed(2)),
+            target_latitude: Number((drone.lat + 0.0005).toFixed(7)),
+            target_longitude: Number((drone.lon + 0.0005).toFixed(7)),
             wind_u: Number(drone.wind_u.toFixed(3)),
             wind_v: Number(drone.wind_v.toFixed(3)),
             wind_w: Number(drone.wind_w.toFixed(3)),
+            payload: {
+                simulator: true,
+                flight_status: 2,
+                droneId: drone.droneId,
+                drone_id: drone.droneId,
+                timestamp: new Date().toISOString(),
+                latitude: Number(drone.lat.toFixed(7)),
+                longitude: Number(drone.lon.toFixed(7)),
+                altitude: Number(drone.altitude.toFixed(1)),
+                sniffer_ppm: Number(drone.sniffer_ppm.toFixed(3)),
+                purway_ppn: Number(drone.purway_ppn.toFixed(2)),
+                target_latitude: Number((drone.lat + 0.0005).toFixed(7)),
+                target_longitude: Number((drone.lon + 0.0005).toFixed(7)),
+                wind_u: Number(drone.wind_u.toFixed(3)),
+                wind_v: Number(drone.wind_v.toFixed(3)),
+                wind_w: Number(drone.wind_w.toFixed(3)),
+            },
         };
 
         client.publish(drone.topic, JSON.stringify(payload), { qos: 1 }, (error) => {

@@ -1,0 +1,1974 @@
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import mapboxgl from "mapbox-gl";
+import { MapboxOverlay } from "@deck.gl/mapbox";
+import { GeoJsonLayer, PathLayer, ScatterplotLayer, TextLayer } from "@deck.gl/layers";
+import { HeatmapLayer } from "@deck.gl/aggregation-layers";
+import satelliteImage from "../assets/satellite.png";
+import { tw, color } from "../constants/tailwind";
+import {
+    buildOfflineImageCoordinates,
+    buildOfflineSatelliteStyle,
+    shouldUseOnlineMap,
+} from "../constants/offlineMap";
+import {
+    buildHeatmapColorExpression,
+    buildHeatmapWeightExpression,
+    buildHotspotHaloRadiusExpression,
+    buildHotspotRadiusExpression,
+    buildMethaneColorExpression,
+    buildMethaneGradient,
+    buildMethaneScale,
+    formatLegendValue,
+    minimumLegendSpan,
+} from "../constants/methaneScale";
+import {
+    backendHttpUrl,
+    createTelemetryWebSocket,
+    waitForBackendReady,
+} from "../services/api";
+import {
+    extractTelemetryMetrics,
+    SENSOR_MODE_AERIS,
+} from "../constants/telemetryMetrics";
+import { traceOrigin, buildMethanePlumeDataset } from "../data/methaneTraceData";
+
+const latitude = traceOrigin.latitude;
+const longitude = traceOrigin.longitude;
+const altitude = traceOrigin.altitude;
+const mapboxToken = import.meta.env.VITE_MAPBOX_TOKEN;
+
+const DRONE_COLOR_BY_ID = {
+    M350: "#f97316",
+    "M400-1": "#22c55e",
+    "M400-2": "#3b82f6",
+};
+
+const DRONE_COLOR_FALLBACK_PALETTE = [
+    "#f97316",
+    "#22c55e",
+    "#3b82f6",
+    "#ef4444",
+    "#a855f7",
+    "#06b6d4",
+    "#eab308",
+    "#14b8a6",
+];
+
+const EMPTY_FEATURE_COLLECTION = { type: "FeatureCollection", features: [] };
+
+const toFiniteNumber = (value) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+};
+
+const hexToRgba = (hex, alpha = 255) => {
+    const normalized = String(hex || "").replace("#", "");
+    const expanded = normalized.length === 3
+        ? normalized.split("").map((character) => character + character).join("")
+        : normalized.padEnd(6, "0").slice(0, 6);
+
+    return [
+        Number.parseInt(expanded.slice(0, 2), 16) || 0,
+        Number.parseInt(expanded.slice(2, 4), 16) || 0,
+        Number.parseInt(expanded.slice(4, 6), 16) || 0,
+        alpha,
+    ];
+};
+
+const getDroneColor = (droneId) => {
+    const normalizedDroneId = String(droneId || "").trim();
+    if (!normalizedDroneId) {
+        return color.fligthpathOrange;
+    }
+
+    const knownColor = DRONE_COLOR_BY_ID[normalizedDroneId];
+    if (knownColor) {
+        return knownColor;
+    }
+
+    const hash = [...normalizedDroneId].reduce(
+        (total, character) => total + character.charCodeAt(0),
+        0,
+    );
+
+    return DRONE_COLOR_FALLBACK_PALETTE[
+        hash % DRONE_COLOR_FALLBACK_PALETTE.length
+    ];
+};
+
+const normalizeDroneState = (entry) => ({
+    ...extractTelemetryMetrics(entry),
+    drone_id: entry.drone_id,
+    topic: entry.topic,
+    ts: entry.ts,
+    latitude: toFiniteNumber(entry.latitude),
+    longitude: toFiniteNumber(entry.longitude),
+    altitude: toFiniteNumber(entry.altitude),
+    target_latitude: toFiniteNumber(
+        entry.target_latitude ?? entry.payload?.target_position?.latitude,
+    ),
+    target_longitude: toFiniteNumber(
+        entry.target_longitude ?? entry.payload?.target_position?.longitude,
+    ),
+    battery: toFiniteNumber(entry.battery),
+    speed: toFiniteNumber(entry.speed),
+    payload: entry.payload || {},
+});
+
+const buildVisibleDroneIdSet = (visibleDroneIds) =>
+    new Set(
+        (Array.isArray(visibleDroneIds) ? visibleDroneIds : [])
+            .map((droneId) => String(droneId || "").trim())
+            .filter(Boolean),
+    );
+
+const isDroneVisible = (droneId, visibleDroneIdSet, hasVisibilityFilter) => {
+    if (!hasVisibilityFilter) {
+        return true;
+    }
+
+    return visibleDroneIdSet.has(String(droneId || "").trim());
+};
+
+const buildDroneFeatureCollection = (
+    drones,
+    visibleDroneIdSet,
+    hasVisibilityFilter,
+) => ({
+    type: "FeatureCollection",
+    features: drones
+        .filter((drone) =>
+            isDroneVisible(drone.drone_id, visibleDroneIdSet, hasVisibilityFilter),
+        )
+        .filter(
+            (drone) =>
+                Number.isFinite(drone.longitude) && Number.isFinite(drone.latitude),
+        )
+        .map((drone) => ({
+            type: "Feature",
+            geometry: {
+                type: "Point",
+                coordinates: [drone.longitude, drone.latitude],
+            },
+            properties: {
+                droneId: drone.drone_id,
+                markerColor: getDroneColor(drone.drone_id),
+                topic: drone.topic,
+                altitude: drone.altitude,
+                battery: drone.battery,
+                speed: drone.speed,
+                sniffer: drone.sniffer,
+                purway: drone.purway,
+                acetylene: drone.acetylene,
+                nitrousOxide: drone.nitrousOxide,
+                sensorMode: drone.sensorMode,
+                methane: drone.methane,
+                ts: drone.ts,
+            },
+        })),
+});
+
+const buildDisplayedTraceDataset = (
+    traceDataset,
+    showTargetMarkers,
+    visibleDroneIdSet,
+    hasVisibilityFilter,
+) => ({
+    type: "FeatureCollection",
+    features: (traceDataset?.features || [])
+        .filter((feature) =>
+            isDroneVisible(
+                feature?.properties?.droneId,
+                visibleDroneIdSet,
+                hasVisibilityFilter,
+            ),
+        )
+        .map((feature) => {
+            const properties = feature?.properties || {};
+            let nextLongitude;
+            let nextLatitude;
+            let mapCoordinates;
+
+            if (showTargetMarkers) {
+                const targetLongitude = toFiniteNumber(properties.targetLongitude);
+                const targetLatitude = toFiniteNumber(properties.targetLatitude);
+                const isValidTarget =
+                    targetLongitude !== 0 &&
+                    targetLatitude !== 0 &&
+                    Number.isFinite(targetLongitude) &&
+                    Number.isFinite(targetLatitude);
+
+                if (isValidTarget) {
+                    nextLongitude = targetLongitude;
+                    nextLatitude = targetLatitude;
+                    mapCoordinates = "target";
+                } else {
+                    nextLongitude = toFiniteNumber(properties.sourceLongitude) ?? targetLongitude;
+                    nextLatitude = toFiniteNumber(properties.sourceLatitude) ?? targetLatitude;
+                    mapCoordinates = "drone";
+                }
+            } else {
+                nextLongitude = toFiniteNumber(properties.sourceLongitude) ?? toFiniteNumber(properties.targetLongitude);
+                nextLatitude = toFiniteNumber(properties.sourceLatitude) ?? toFiniteNumber(properties.targetLatitude);
+                mapCoordinates = "drone";
+            }
+
+            if (!Number.isFinite(nextLongitude) || !Number.isFinite(nextLatitude)) {
+                return null;
+            }
+
+            return {
+                ...feature,
+                geometry: {
+                    ...feature.geometry,
+                    coordinates: [nextLongitude, nextLatitude],
+                },
+                properties: {
+                    ...properties,
+                    mapCoordinates,
+                },
+            };
+        })
+        .filter(Boolean),
+});
+
+const getTraceMaxMethane = (dataset) => {
+    if (!dataset?.features?.length) {
+        return 5;
+    }
+
+    let max = 5;
+    for (const feature of dataset.features) {
+        const value = Number(feature?.properties?.methane);
+        if (Number.isFinite(value) && value > max) {
+            max = value;
+        }
+    }
+
+    return max;
+};
+
+const fitMapToTraceDataset = (map, dataset, { padding = 20, duration = 650, maxZoom = 17 } = {}) => {
+    if (!map || !dataset?.features?.length) {
+        return;
+    }
+
+    const bounds = new mapboxgl.LngLatBounds();
+    let hasValidPoints = false;
+
+    dataset.features.forEach((feature) => {
+        const coordinates = feature?.geometry?.coordinates;
+        const lng = Number(coordinates?.[0]);
+        const lat = Number(coordinates?.[1]);
+
+        if (Number.isFinite(lng) && Number.isFinite(lat)) {
+            bounds.extend([lng, lat]);
+            hasValidPoints = true;
+        }
+    });
+
+    if (!hasValidPoints) {
+        return;
+    }
+
+    map.fitBounds(bounds, {
+        padding,
+        duration,
+        maxZoom,
+        essential: true,
+    });
+};
+
+const fitMapToDroneStates = (map, drones, { padding = 60, duration = 700, maxZoom = 17 } = {}) => {
+    if (!map || !Array.isArray(drones) || drones.length === 0) {
+        return false;
+    }
+
+    const bounds = new mapboxgl.LngLatBounds();
+    let hasValidPoints = false;
+
+    drones.forEach((drone) => {
+        const lng = Number(drone?.longitude);
+        const lat = Number(drone?.latitude);
+
+        if (Number.isFinite(lng) && Number.isFinite(lat)) {
+            bounds.extend([lng, lat]);
+            hasValidPoints = true;
+        }
+    });
+
+    if (!hasValidPoints) {
+        return false;
+    }
+
+    map.fitBounds(bounds, {
+        padding,
+        duration,
+        maxZoom,
+        essential: true,
+    });
+
+    return true;
+};
+
+const buildTracePopupHtml = (feature) => {
+    const properties = feature?.properties || {};
+    const isAerisTrace = properties.sensorMode === SENSOR_MODE_AERIS;
+    // const methane = Number(properties.methane ?? 0).toFixed(2);
+    const hoveredFeature = event.features?.[0];
+
+    if (!hoveredFeature) {
+        return;
+    }
+
+    const {
+        methane,
+        ch4,
+        sniffer,
+        purway,
+        acetylene,
+        nitrousOxide,
+        displayMetricLabel,
+        displayMetricUnits,
+        altitude: pointAltitude,
+        sampleIndex,
+        timeLabel,
+    } = hoveredFeature.properties;
+    return `
+                            <div style="min-width: 148px; color: #e5eef8;">
+                                <div style="font-size: 10px; text-transform: uppercase; letter-spacing: 0.14em; color: #9fb0c2;">Sample ${sampleIndex}</div>
+                                <div style="margin-top: 4px; font-size: 13px; font-weight: 700; color: #ffffff;">${displayMetricLabel || (isAerisTrace ? "CH4" : "Purway")} ${Number(methane ?? 0).toFixed(2)} ${displayMetricUnits || (isAerisTrace ? "ppm" : "ppm-m")}</div>
+                                ${isAerisTrace
+            ? `<div style="margin-top: 2px; font-size: 12px; color: #d2dce8;">CH4 ${Number(ch4 ?? 0).toFixed(2)} ppm</div>`
+            : `<div style="margin-top: 2px; font-size: 12px; color: #d2dce8;">CH4 ${Number(ch4 ?? 0).toFixed(2)} ppm</div>`
+        }
+                                ${isAerisTrace
+            ? `<div style="margin-top: 2px; font-size: 12px; color: #d2dce8;">Acetylene ${Number(acetylene ?? 0).toFixed(2)} ppm</div>
+                                <div style="margin-top: 2px; font-size: 12px; color: #d2dce8;">Nitrous Oxide ${Number(nitrousOxide ?? 0).toFixed(2)} ppm</div>`
+            : `<div style="margin-top: 2px; font-size: 12px; color: #d2dce8;">Sniffer ${Number(sniffer ?? 0).toFixed(2)} ppm</div>
+                                  <div style="margin-top: 2px; font-size: 12px; color: #d2dce8;">Purway ${Number(purway ?? 0).toFixed(2)} ppm-m</div>`
+        }
+                                <div style="margin-top: 4px; font-size: 12px; color: #d2dce8;">Altitude ${Number(pointAltitude).toFixed(0)} m</div>
+                                <div style="margin-top: 2px; font-size: 11px; color: #9fb0c2;">Flight mark ${timeLabel}</div>
+                            </div>
+                        `;
+};
+
+const buildDronePopupHtml = (feature) => {
+    const properties = feature?.properties || {};
+    return `
+    <div style="min-width: 160px; color: #e5eef8;">
+      <div style="font-size: 10px; text-transform: uppercase; letter-spacing: 0.14em; color: #9fb0c2;">${properties.droneId ?? "Drone"}</div>
+      <div style="margin-top: 4px; font-size: 12px; color: #ffffff;">Alt ${Number(properties.altitude ?? 0).toFixed(1)} m</div>
+      <div style="margin-top: 2px; font-size: 12px; color: #d2dce8;">Battery ${properties.battery ?? "-"}%</div>
+      <div style="margin-top: 2px; font-size: 12px; color: #d2dce8;">Speed ${properties.speed ?? "-"} m/s</div>
+      <div style="margin-top: 2px; font-size: 11px; color: #9fb0c2;">${properties.ts ? new Date(properties.ts).toLocaleString() : ""}</div>
+    </div>
+  `;
+};
+
+export function DeckMap({
+    traceDataset,
+    onScaleChange,
+    selectedDroneId,
+    visibleDroneIds,
+    devices = [],
+    showAllPlottedData = true,
+    onToggleAllPlottedData,
+    droneVisibilityById = {},
+    onToggleDroneVisibility,
+    methaneValidityVisibility = { valid: true, invalid: true, noData: false },
+    onToggleMethaneValidity,
+    resultsPageMode,
+    heatmapEnabled = true,
+    plumeViewEnabled = false,
+    traceOpacity = 1,
+    onToggleHeatmap,
+    onTogglePlumeView,
+    onPlumeViewAutoChange,
+    onTraceRenderComplete,
+}) {
+    const mapContainerRef = useRef(null);
+    const mapRef = useRef(null);
+    const deckOverlayRef = useRef(null);
+    const popupRef = useRef(null);
+    const plumeTransitionFrameRef = useRef(null);
+    const traceSourceUpdateTimeoutRef = useRef(null);
+    const plumeModeFromTiltRef = useRef(plumeViewEnabled);
+
+    const datasetMaxMethane = getTraceMaxMethane(traceDataset);
+    const initialMapSetupRef = useRef(null);
+    const [upperLimit, setUpperLimit] = useState(datasetMaxMethane);
+    const [lowerLimit, setLowerLimit] = useState(0);
+    const [upperLimitInput, setUpperLimitInput] = useState(String(datasetMaxMethane));
+    const [lowerLimitInput, setLowerLimitInput] = useState("0");
+    const [showFlightPath, setShowFlightPath] = useState(false);
+    const [showTargetMarkers, setShowTargetMarkers] = useState(false);
+    const [isAutoCenterEnabled, setIsAutoCenterEnabled] = useState(true);
+    const [droneStates, setDroneStates] = useState([]);
+    const [, setDroneTrackHistory] = useState({});
+    const [isTelemetryConnected, setIsTelemetryConnected] = useState(false);
+    const [mapMode, setMapMode] = useState(() =>
+        shouldUseOnlineMap(mapboxToken) ? "online" : "offline",
+    );
+
+    const safeTraceOpacity = Math.min(
+        1,
+        Math.max(0, Number.isFinite(Number(traceOpacity)) ? Number(traceOpacity) : 1),
+    );
+
+    const methaneScale = useMemo(() => buildMethaneScale(lowerLimit, upperLimit), [lowerLimit, upperLimit]);
+    const methaneGradient = useMemo(() => buildMethaneGradient(lowerLimit, upperLimit), [lowerLimit, upperLimit]);
+    const visibleDroneIdSet = useMemo(() => buildVisibleDroneIdSet(visibleDroneIds), [visibleDroneIds]);
+    const hasVisibilityFilter = Array.isArray(visibleDroneIds);
+    const displayedTraceDataset = useMemo(
+        () => buildDisplayedTraceDataset(traceDataset, showTargetMarkers, visibleDroneIdSet, hasVisibilityFilter),
+        [hasVisibilityFilter, showTargetMarkers, traceDataset, visibleDroneIdSet],
+    );
+    const methanePlumeDataset = useMemo(
+        () => (resultsPageMode ? buildMethanePlumeDataset(traceDataset) : EMPTY_FEATURE_COLLECTION),
+        [resultsPageMode, traceDataset],
+    );
+
+    const focusedDrone =
+        droneStates.find(
+            (drone) =>
+                drone.drone_id === selectedDroneId &&
+                isDroneVisible(drone.drone_id, visibleDroneIdSet, hasVisibilityFilter),
+        ) ||
+        droneStates.find((drone) =>
+            isDroneVisible(drone.drone_id, visibleDroneIdSet, hasVisibilityFilter),
+        ) ||
+        droneStates[0] ||
+        null;
+
+    const visibleDroneStates = useMemo(
+        () =>
+            droneStates.filter((drone) =>
+                isDroneVisible(drone.drone_id, visibleDroneIdSet, hasVisibilityFilter),
+            ),
+        [droneStates, hasVisibilityFilter, visibleDroneIdSet],
+    );
+
+    const displayLatitude = Number.isFinite(focusedDrone?.latitude) ? focusedDrone.latitude : latitude;
+    const displayLongitude = Number.isFinite(focusedDrone?.longitude) ? focusedDrone.longitude : longitude;
+    const displayAltitude = Number.isFinite(focusedDrone?.altitude) ? focusedDrone.altitude : altitude;
+
+    const initialTraceCenter = useMemo(
+        () => {
+            const features = displayedTraceDataset?.features || [];
+            if (!features.length) {
+                return { latitude: displayLatitude, longitude: displayLongitude };
+            }
+
+            const bounds = new mapboxgl.LngLatBounds();
+            let hasValidPoints = false;
+
+            features.forEach((feature) => {
+                const coordinates = feature?.geometry?.coordinates;
+                const lng = Number(coordinates?.[0]);
+                const lat = Number(coordinates?.[1]);
+                if (Number.isFinite(lng) && Number.isFinite(lat)) {
+                    bounds.extend([lng, lat]);
+                    hasValidPoints = true;
+                }
+            });
+
+            if (!hasValidPoints) {
+                return { latitude: displayLatitude, longitude: displayLongitude };
+            }
+
+            const center = bounds.getCenter();
+            return { latitude: center.lat, longitude: center.lng };
+        },
+        [displayLatitude, displayLongitude, displayedTraceDataset],
+    );
+
+    if (initialMapSetupRef.current === null) {
+        initialMapSetupRef.current = {
+            isOnlineMode: shouldUseOnlineMap(mapboxToken),
+            initialCenterLatitude: resultsPageMode
+                ? initialTraceCenter.latitude
+                : displayLatitude,
+            initialCenterLongitude: resultsPageMode
+                ? initialTraceCenter.longitude
+                : displayLongitude,
+            initialDisplayedTraceDataset: displayedTraceDataset,
+            initialIsAutoCenterEnabled: isAutoCenterEnabled,
+            initialPlumeViewEnabled: plumeViewEnabled,
+            initialResultsPageMode: resultsPageMode,
+        };
+    }
+
+    const getScaleColor = useCallback((value) => {
+        const span = Math.max(upperLimit - lowerLimit, minimumLegendSpan);
+        const ratio = Math.min(Math.max((Number(value ?? 0) - lowerLimit) / span, 0), 1);
+        const index = Math.min(
+            methaneScale.length - 1,
+            Math.max(0, Math.round(ratio * (methaneScale.length - 1))),
+        );
+        return methaneScale[index]?.swatch || color.text;
+    }, [lowerLimit, methaneScale, upperLimit]);
+    useEffect(() => {
+        const currentMap = mapRef.current;
+
+        if (
+            !currentMap ||
+            !currentMap.getLayer("methane-trace-heatmap") ||
+            !currentMap.getLayer("methane-trace-hotspots") ||
+            !currentMap.getLayer("methane-trace-halo") ||
+            !currentMap.getLayer("methane-plume-columns")
+        ) {
+            return;
+        }
+
+        currentMap.setPaintProperty(
+            "methane-trace-heatmap",
+            "heatmap-weight",
+            buildHeatmapWeightExpression(lowerLimit, upperLimit),
+        );
+        currentMap.setPaintProperty(
+            "methane-trace-heatmap",
+            "heatmap-color",
+            buildHeatmapColorExpression(lowerLimit, upperLimit),
+        );
+        currentMap.setPaintProperty(
+            "methane-trace-hotspots",
+            "circle-color",
+            buildMethaneColorExpression(lowerLimit, upperLimit),
+        );
+        currentMap.setPaintProperty(
+            "methane-trace-halo",
+            "circle-color",
+            buildMethaneColorExpression(lowerLimit, upperLimit),
+        );
+        currentMap.setPaintProperty(
+            "methane-trace-hotspots",
+            "circle-radius",
+            buildHotspotRadiusExpression(lowerLimit, upperLimit),
+        );
+        currentMap.setPaintProperty(
+            "methane-trace-halo",
+            "circle-radius",
+            buildHotspotHaloRadiusExpression(lowerLimit, upperLimit),
+        );
+
+        const span = Math.max(upperLimit - lowerLimit, minimumLegendSpan);
+        const heatmapThreshold = lowerLimit + span * 0.04;
+        currentMap.setFilter("methane-trace-heatmap", [
+            ">=",
+            ["get", "methane"],
+            heatmapThreshold,
+        ]);
+        currentMap.setPaintProperty(
+            "methane-plume-columns",
+            "fill-extrusion-color",
+            buildMethaneColorExpression(lowerLimit, upperLimit),
+        );
+    }, [lowerLimit, upperLimit]);
+
+    const deckLayers = useMemo(() => {
+        const traceFeatures = displayedTraceDataset?.features || [];
+        const plumeFeatures = methanePlumeDataset?.features || [];
+        const liveDroneFeatures = buildDroneFeatureCollection(
+            visibleDroneStates,
+            visibleDroneIdSet,
+            hasVisibilityFilter,
+        ).features;
+        const zeroOpacity = resultsPageMode
+            ? 0.18 * safeTraceOpacity
+            : plumeViewEnabled
+                ? 0.15 * safeTraceOpacity
+                : 0.88 * safeTraceOpacity;
+        const hotspotOpacity = resultsPageMode
+            ? 0.95 * safeTraceOpacity
+            : plumeViewEnabled
+                ? 0.15 * safeTraceOpacity
+                : 0.8 * safeTraceOpacity;
+        const haloOpacity = resultsPageMode
+            ? heatmapEnabled
+                ? 0.46 * safeTraceOpacity
+                : 0
+            : plumeViewEnabled
+                ? heatmapEnabled
+                    ? 0.1 * safeTraceOpacity
+                    : 0
+                : heatmapEnabled
+                    ? 0.36 * safeTraceOpacity
+                    : 0;
+        const plumeOpacity = plumeViewEnabled ? 0.82 * safeTraceOpacity : 0;
+        const plumeCapsOpacity = plumeViewEnabled ? 0.45 * safeTraceOpacity : 0;
+
+        const setHoverCursor = () => {
+            if (mapRef.current) {
+                mapRef.current.getCanvas().style.cursor = "pointer";
+            }
+        };
+
+        const clearHover = () => {
+            popupRef.current?.remove();
+            if (mapRef.current) {
+                mapRef.current.getCanvas().style.cursor = "";
+            }
+        };
+
+        const showHover = (coordinate, html) => {
+            if (!popupRef.current || !mapRef.current || !coordinate) {
+                return;
+            }
+
+            popupRef.current.setLngLat(coordinate).setHTML(html).addTo(mapRef.current);
+        };
+
+        return [
+            // new HeatmapLayer({
+            //     id: "methane-trace-heatmap",
+            //     data: traceFeatures,
+            //     aggregation: 'SUM',
+            //     pickable: false,
+            //     visible: traceHeatmapOpacity > 0,
+            //     getPosition: (feature) => feature.geometry.coordinates,
+            //     getWeight: (feature) => Number(feature?.properties?.methane ?? 0),
+            //     // radiusPixels: resultsPageMode ? 20 : 15,
+            //     // intensity: resultsPageMode ? 1.65 : 1.1,
+            //     radiusPixels: 25,
+            //     intensity: 1,
+            //     threshold: 0.02,
+            //     colorRange: buildMethaneScale(lowerLimit, upperLimit)
+            //         .slice()
+            //         .reverse()
+            //         .map((entry) => hexToRgba(entry.swatch, 210)),
+            //     opacity: traceHeatmapOpacity,
+            // }),
+            new ScatterplotLayer({
+                id: "methane-trace-zero-points",
+                data: traceFeatures.filter((feature) => Number(feature?.properties?.methane ?? 0) === 0),
+                pickable: true,
+                visible: zeroOpacity > 0,
+                getPosition: (feature) => feature.geometry.coordinates,
+                getFillColor: (feature) => hexToRgba(feature?.properties?.pointColor || color.textMuted, 210),
+                getRadius: 3,
+                radiusMinPixels: 2,
+                radiusMaxPixels: 6,
+                _stroked: true,
+                get stroked() {
+                    return this._stroked;
+                },
+                set stroked(value) {
+                    this._stroked = value;
+                },
+                lineWidthMinPixels: 1,
+                getLineColor: [255, 255, 255, 184],
+                opacity: zeroOpacity,
+                onHover: (info) => {
+                    if (!info?.object) {
+                        clearHover();
+                        return;
+                    }
+
+                    setHoverCursor();
+                    showHover(info.coordinate, buildTracePopupHtml(info.object));
+                },
+            }),
+            new ScatterplotLayer({
+                id: "methane-trace-hotspots",
+                data: traceFeatures.filter((feature) => Number(feature?.properties?.methane ?? 0) > 0),
+                pickable: true,
+                visible: hotspotOpacity > 0,
+                getPosition: (feature) => feature.geometry.coordinates,
+                getFillColor: (feature) => hexToRgba(getScaleColor(feature?.properties?.methane), 220),
+                getRadius: (feature) => {
+                    const methane = Number(feature?.properties?.methane ?? 0);
+                    const span = Math.max(upperLimit - lowerLimit, minimumLegendSpan);
+                    const ratio = Math.min(Math.max((methane - lowerLimit) / span, 0), 1);
+                    return 2.5 + ratio * 4;
+                },
+                radiusMinPixels: 2.5,
+                radiusMaxPixels: 6.5,
+                stroked: true,
+                lineWidthMinPixels: 1,
+                getLineColor: [255, 255, 255, 230],
+                opacity: hotspotOpacity,
+                onHover: (info) => {
+                    if (!info?.object) {
+                        clearHover();
+                        return;
+                    }
+
+                    setHoverCursor();
+                    showHover(info.coordinate, buildTracePopupHtml(info.object));
+                },
+            }),
+            new ScatterplotLayer({
+                id: "methane-trace-halo",
+                data: traceFeatures.filter((feature) => Number(feature?.properties?.methane ?? 0) > 0),
+                pickable: false,
+                visible: haloOpacity > 0,
+                getPosition: (feature) => feature.geometry.coordinates,
+                getFillColor: (feature) => hexToRgba(getScaleColor(feature?.properties?.methane), 90),
+                getRadius: (feature) => {
+                    const methane = Number(feature?.properties?.methane ?? 0);
+                    const span = Math.max(upperLimit - lowerLimit, minimumLegendSpan);
+                    const ratio = Math.min(Math.max((methane - lowerLimit) / span, 0), 1);
+                    return 7 + ratio * 9;
+                },
+                radiusMinPixels: 6,
+                radiusMaxPixels: 16,
+                stroked: false,
+                opacity: haloOpacity,
+            }),
+            new GeoJsonLayer({
+                id: "methane-plume-columns",
+                data: plumeFeatures,
+                pickable: false,
+                filled: true,
+                stroked: false,
+                extruded: true,
+                wireframe: false,
+                getFillColor: (feature) => hexToRgba(getScaleColor(feature?.properties?.methane), 210),
+                getElevation: (feature) => Number(feature?.properties?.plumeHeight ?? 0),
+                elevationScale: 14,
+                opacity: plumeOpacity,
+            }),
+            new GeoJsonLayer({
+                id: "methane-plume-caps",
+                data: plumeFeatures,
+                pickable: false,
+                filled: false,
+                stroked: true,
+                wireframe: false,
+                lineWidthMinPixels: 1.1,
+                getLineColor: [255, 255, 255, 220],
+                opacity: plumeCapsOpacity,
+            }),
+            // new PathLayer({
+            //     id: "flight-path-line",
+            //     data: flightPathDataset.features,
+            //     pickable: false,
+            //     visible: showFlightPath,
+            //     getPath: (feature) => feature.geometry.coordinates,
+            //     getColor: (feature) => hexToRgba(feature?.properties?.pathColor || color.fligthpathOrange, 220),
+            //     getWidth: resultsPageMode ? 3 : 2,
+            //     widthMinPixels: 2,
+            //     widthScale: 1,
+            //     rounded: true,
+            // }),
+            new ScatterplotLayer({
+                id: "live-drones-points",
+                data: liveDroneFeatures,
+                pickable: true,
+                visible: true,
+                getPosition: (feature) => feature.geometry.coordinates,
+                getFillColor: (feature) => hexToRgba(getDroneColor(feature?.properties?.drone_id), 230),
+                getRadius: 8,
+                radiusMinPixels: 5,
+                radiusMaxPixels: 10,
+                stroked: true,
+                lineWidthMinPixels: 1.4,
+                getLineColor: [255, 255, 255, 255],
+                opacity: 0.94,
+                onHover: (info) => {
+                    if (!info?.object) {
+                        clearHover();
+                        return;
+                    }
+
+                    setHoverCursor();
+                    showHover(info.coordinate, buildDronePopupHtml(info.object));
+                },
+            }),
+            new TextLayer({
+                id: "live-drones-labels",
+                data: liveDroneFeatures,
+                pickable: false,
+                getPosition: (feature) => feature.geometry.coordinates,
+                getText: (feature) => feature?.properties?.drone_id || "",
+                getSize: 11,
+                getColor: [255, 255, 255, 255],
+                getTextAnchor: "middle",
+                getAlignmentBaseline: "center",
+                getPixelOffset: [0, 14],
+                background: true,
+                backgroundColor: [0, 0, 0, 180],
+            }),
+        ];
+    }, [
+        displayedTraceDataset,
+        getScaleColor,
+        hasVisibilityFilter,
+        heatmapEnabled,
+        lowerLimit,
+        methanePlumeDataset,
+        plumeViewEnabled,
+        resultsPageMode,
+        safeTraceOpacity,
+        upperLimit,
+        visibleDroneIdSet,
+        visibleDroneStates,
+    ]);
+
+    const initialDeckLayersRef = useRef(null);
+    if (initialDeckLayersRef.current === null) {
+        initialDeckLayersRef.current = deckLayers;
+    }
+
+    const handleLimitChange = (limitType, rawValue) => {
+        const nextValue = rawValue.replace(",", ".");
+
+        if (limitType === "upper") {
+            setUpperLimitInput(nextValue);
+        } else {
+            setLowerLimitInput(nextValue);
+        }
+
+        const parsedValue = Number(nextValue);
+        if (!Number.isFinite(parsedValue)) {
+            return;
+        }
+
+        if (limitType === "upper" && parsedValue > lowerLimit) {
+            setUpperLimit(parsedValue);
+        }
+
+        if (limitType === "lower" && parsedValue < upperLimit) {
+            setLowerLimit(parsedValue);
+        }
+    };
+
+    const commitLimit = (limitType) => {
+        if (limitType === "upper") {
+            const parsedValue = Number(upperLimitInput);
+            const safeValue = Number.isFinite(parsedValue)
+                ? Math.max(parsedValue, lowerLimit + minimumLegendSpan)
+                : upperLimit;
+
+            setUpperLimit(safeValue);
+            setUpperLimitInput(formatLegendValue(safeValue));
+            return;
+        }
+
+        const parsedValue = Number(lowerLimitInput);
+        const safeValue = Number.isFinite(parsedValue)
+            ? Math.min(parsedValue, upperLimit - minimumLegendSpan)
+            : lowerLimit;
+
+        setLowerLimit(safeValue);
+        setLowerLimitInput(formatLegendValue(safeValue));
+    };
+
+    useEffect(() => {
+        if (!mapContainerRef.current || mapRef.current) {
+            return undefined;
+        }
+
+        const {
+            isOnlineMode,
+            initialCenterLatitude,
+            initialCenterLongitude,
+            initialDisplayedTraceDataset,
+            initialIsAutoCenterEnabled,
+            initialPlumeViewEnabled,
+            initialResultsPageMode,
+        } = initialMapSetupRef.current || {};
+        const offlineCoordinates = buildOfflineImageCoordinates({
+            centerLat: initialCenterLatitude,
+            centerLon: initialCenterLongitude,
+        });
+
+        if (isOnlineMode) {
+            mapboxgl.accessToken = mapboxToken;
+        }
+
+        const map = new mapboxgl.Map({
+            container: mapContainerRef.current,
+            style: isOnlineMode
+                ? "mapbox://styles/mapbox/satellite-streets-v12"
+                : buildOfflineSatelliteStyle({
+                    imageUrl: satelliteImage,
+                    coordinates: offlineCoordinates,
+                }),
+            center: [initialCenterLongitude, initialCenterLatitude],
+            zoom: 18,
+            pitch: 0,
+            bearing: 0,
+            attributionControl: false,
+        });
+
+        const overlay = new MapboxOverlay({
+            interleaved: true,
+            layers: initialDeckLayersRef.current,
+        });
+        mapRef.current = map;
+        deckOverlayRef.current = overlay;
+        popupRef.current = new mapboxgl.Popup({
+            closeButton: false,
+            closeOnClick: false,
+            offset: 14,
+            className: "methane-trace-popup",
+        });
+        setMapMode(isOnlineMode ? "online" : "offline");
+
+        map.addControl(new mapboxgl.NavigationControl(), "top-right");
+        map.addControl(overlay);
+
+        map.on("load", () => {
+            if (!isOnlineMode && !initialResultsPageMode) {
+                map.fitBounds([offlineCoordinates[3], offlineCoordinates[1]], {
+                    duration: 0,
+                    padding: 20,
+                });
+            }
+
+            if (isOnlineMode) {
+                map.addSource("mapbox-dem", {
+                    type: "raster-dem",
+                    url: "mapbox://mapbox.mapbox-terrain-dem-v1",
+                    tileSize: 512,
+                    maxzoom: 14,
+                });
+            }
+
+            if (initialResultsPageMode && initialIsAutoCenterEnabled) {
+                fitMapToTraceDataset(map, initialDisplayedTraceDataset, {
+                    padding: initialPlumeViewEnabled ? 120 : 20,
+                    duration: 0,
+                    maxZoom: 18,
+                });
+
+                if (initialPlumeViewEnabled) {
+                    map.easeTo({
+                        pitch: 72,
+                        bearing: 34,
+                        duration: 0,
+                        essential: true,
+                    });
+                }
+            }
+            map.resize();
+        });
+
+        return () => {
+            if (plumeTransitionFrameRef.current) {
+                cancelAnimationFrame(plumeTransitionFrameRef.current);
+                plumeTransitionFrameRef.current = null;
+            }
+            if (traceSourceUpdateTimeoutRef.current) {
+                window.clearTimeout(traceSourceUpdateTimeoutRef.current);
+                traceSourceUpdateTimeoutRef.current = null;
+            }
+            popupRef.current?.remove();
+            popupRef.current = null;
+            deckOverlayRef.current = null;
+            map.remove();
+            mapRef.current = null;
+        };
+    }, []);
+
+    useEffect(() => {
+        deckOverlayRef.current?.setProps({ layers: deckLayers });
+    }, [deckLayers]);
+
+    useEffect(() => {
+        const currentMap = mapRef.current;
+        if (!currentMap) {
+            return;
+        }
+
+        if (resultsPageMode) {
+            currentMap.easeTo({
+                pitch: plumeViewEnabled ? 72 : 0,
+                bearing: plumeViewEnabled ? 34 : 0,
+                duration: 500,
+                essential: true,
+            });
+        }
+
+        if (mapMode !== "online") {
+            return;
+        }
+
+        const applyTerrainIfReady = () => {
+            const activeMap = mapRef.current;
+            if (!activeMap) {
+                return true;
+            }
+
+            const hasLoadedStyle = activeMap.isStyleLoaded();
+            const hasDemSource = Boolean(activeMap.getSource("mapbox-dem"));
+
+            if (!hasLoadedStyle || !hasDemSource) {
+                return false;
+            }
+
+            activeMap.setTerrain(
+                plumeViewEnabled ? { source: "mapbox-dem", exaggeration: 1.35 } : null,
+            );
+            return true;
+        };
+
+        if (applyTerrainIfReady()) {
+            return;
+        }
+
+        const handleIdle = () => {
+            applyTerrainIfReady();
+        };
+
+        currentMap.once("idle", handleIdle);
+        return () => {
+            currentMap.off("idle", handleIdle);
+        };
+    }, [mapMode, plumeViewEnabled, resultsPageMode]);
+
+    useEffect(() => {
+        if (resultsPageMode) {
+            return;
+        }
+
+        const currentMap = mapRef.current;
+        if (!currentMap || !isAutoCenterEnabled) {
+            return;
+        }
+
+        if (visibleDroneStates.length > 1) {
+            fitMapToDroneStates(currentMap, visibleDroneStates, {
+                padding: 80,
+                duration: 900,
+                maxZoom: 17,
+            });
+            return;
+        }
+
+        if (
+            !focusedDrone ||
+            !Number.isFinite(displayLatitude) ||
+            !Number.isFinite(displayLongitude)
+        ) {
+            return;
+        }
+
+        currentMap.easeTo({
+            center: [displayLongitude, displayLatitude],
+            duration: 900,
+            essential: true,
+        });
+    }, [
+        displayLatitude,
+        displayLongitude,
+        focusedDrone,
+        isAutoCenterEnabled,
+        resultsPageMode,
+        visibleDroneStates,
+    ]);
+
+    useEffect(() => {
+        const currentMap = mapRef.current;
+        if (!currentMap || !resultsPageMode) {
+            return undefined;
+        }
+
+        const syncPlumeModeFromTilt = () => {
+            const pitch = currentMap.getPitch();
+
+            if (!plumeModeFromTiltRef.current && pitch >= 45) {
+                plumeModeFromTiltRef.current = true;
+                onPlumeViewAutoChange?.(true);
+                return;
+            }
+
+            if (plumeModeFromTiltRef.current && pitch <= 25) {
+                plumeModeFromTiltRef.current = false;
+                onPlumeViewAutoChange?.(false);
+            }
+        };
+
+        currentMap.on("move", syncPlumeModeFromTilt);
+        return () => {
+            currentMap.off("move", syncPlumeModeFromTilt);
+        };
+    }, [onPlumeViewAutoChange, resultsPageMode]);
+
+    useEffect(() => {
+        let isCancelled = false;
+        let socket;
+        let reconnectTimer;
+
+        const upsertDroneState = (incomingEntry) => {
+            const normalizedEntry = normalizeDroneState(incomingEntry);
+            const nextLatitude = normalizedEntry.latitude;
+            const nextLongitude = normalizedEntry.longitude;
+
+            if (Number.isFinite(nextLatitude) && Number.isFinite(nextLongitude)) {
+                setDroneTrackHistory((previousHistory) => {
+                    const existingCoordinates = previousHistory[normalizedEntry.drone_id] || [];
+                    const lastCoordinate = existingCoordinates[existingCoordinates.length - 1];
+
+                    if (
+                        lastCoordinate &&
+                        lastCoordinate[0] === nextLongitude &&
+                        lastCoordinate[1] === nextLatitude
+                    ) {
+                        return previousHistory;
+                    }
+
+                    return {
+                        ...previousHistory,
+                        [normalizedEntry.drone_id]: [
+                            ...existingCoordinates,
+                            [nextLongitude, nextLatitude],
+                        ].slice(-500),
+                    };
+                });
+            }
+
+            setDroneStates((previousState) => {
+                const dedupedState = previousState.filter(
+                    (item) => item.drone_id !== normalizedEntry.drone_id,
+                );
+                const nextState = [normalizedEntry, ...dedupedState];
+                nextState.sort(
+                    (a, b) => new Date(b.ts || 0).getTime() - new Date(a.ts || 0).getTime(),
+                );
+                return nextState;
+            });
+        };
+
+        const loadLatestState = async () => {
+            try {
+                const response = await fetch(`${backendHttpUrl}/api/drones/latest`);
+                if (!response.ok) {
+                    return;
+                }
+
+                const payload = await response.json();
+                if (isCancelled || !Array.isArray(payload?.data)) {
+                    return;
+                }
+
+                const normalizedRows = payload.data.map(normalizeDroneState);
+                normalizedRows.sort(
+                    (a, b) => new Date(b.ts || 0).getTime() - new Date(a.ts || 0).getTime(),
+                );
+                setDroneStates(normalizedRows);
+                setDroneTrackHistory(
+                    normalizedRows.reduce((history, row) => {
+                        if (Number.isFinite(row.longitude) && Number.isFinite(row.latitude)) {
+                            history[row.drone_id] = [[row.longitude, row.latitude]];
+                        }
+
+                        return history;
+                    }, {}),
+                );
+            } catch {
+                // Ignore transient backend failures; websocket reconnect handles recovery.
+            }
+        };
+
+        const connectTelemetrySocket = () => {
+            if (reconnectTimer) {
+                window.clearTimeout(reconnectTimer);
+            }
+
+            try {
+                socket = createTelemetryWebSocket();
+                socket.onopen = () => {
+                    if (!isCancelled) {
+                        setIsTelemetryConnected(true);
+                    }
+                };
+
+                socket.onclose = () => {
+                    if (!isCancelled) {
+                        setIsTelemetryConnected(false);
+                        reconnectTimer = window.setTimeout(connectTelemetrySocket, 1000);
+                    }
+                };
+
+                socket.onerror = () => {
+                    if (!isCancelled) {
+                        setIsTelemetryConnected(false);
+                    }
+
+                    socket?.close();
+                };
+
+                socket.onmessage = (event) => {
+                    try {
+                        const packet = JSON.parse(event.data);
+                        if (packet?.type !== "telemetry" || !packet.data) {
+                            return;
+                        }
+
+                        upsertDroneState(packet.data);
+                    } catch {
+                        // Ignore malformed packets.
+                    }
+                };
+            } catch {
+                setIsTelemetryConnected(false);
+                reconnectTimer = window.setTimeout(connectTelemetrySocket, 1000);
+            }
+        };
+
+        void waitForBackendReady().then((isBackendReady) => {
+            if (!isBackendReady || isCancelled) {
+                return;
+            }
+
+            loadLatestState();
+            connectTelemetrySocket();
+        });
+
+        return () => {
+            isCancelled = true;
+            setIsTelemetryConnected(false);
+            if (reconnectTimer) {
+                window.clearTimeout(reconnectTimer);
+            }
+            if (socket) {
+                socket.onclose = null;
+                socket.close();
+            }
+        };
+    }, []);
+
+    useEffect(() => {
+        onScaleChange?.({ lowerLimit, upperLimit });
+    }, [lowerLimit, onScaleChange, upperLimit]);
+
+    useEffect(() => {
+        onTraceRenderComplete?.();
+    }, [displayedTraceDataset, deckLayers, onTraceRenderComplete]);
+
+    //   return (
+    //     <div className={tw.panel} style={{ backgroundColor: color.card, padding: "0.5rem" }}>
+    //       <div className="flex h-full w-full flex-col gap-3">
+    //         <div className="flex flex-wrap items-center justify-between gap-3">
+    //           <div>
+    //             <p className="text-xs uppercase tracking-[0.18em]" style={{ color: color.green }}>
+    //               Position
+    //             </p>
+    //             <h3 className="text-xl font-bold tracking-tight" style={{ color: color.text }}>
+    //               Drone satellite view
+    //             </h3>
+    //           </div>
+    //           <div
+    //             className="rounded-full px-3 py-1 text-xs font-medium"
+    //             style={{
+    //               backgroundColor: isTelemetryConnected ? color.orangeSoft : color.surface,
+    //               color: isTelemetryConnected ? color.orange : color.textMuted,
+    //             }}
+    //           >
+    //             {isTelemetryConnected ? "Live telemetry" : "Waiting telemetry"} • {mapMode}
+    //           </div>
+    //         </div>
+
+    //         <div className="flex flex-wrap gap-2 rounded-lg border px-3 py-2" style={{ backgroundColor: color.surface, borderColor: color.border }}>
+    //           {!resultsPageMode ? (
+    //             <>
+    //               <button
+    //                 type="button"
+    //                 onClick={() => setIsAutoCenterEnabled((previous) => !previous)}
+    //                 className="rounded-full border px-3 py-1 text-xs font-semibold"
+    //                 style={{
+    //                   backgroundColor: isAutoCenterEnabled ? `${color.green}22` : color.card,
+    //                   borderColor: isAutoCenterEnabled ? color.green : color.border,
+    //                   color: isAutoCenterEnabled ? color.text : color.textMuted,
+    //                 }}
+    //               >
+    //                 Auto Center
+    //               </button>
+    //               <button
+    //                 type="button"
+    //                 onClick={() => setShowFlightPath((previous) => !previous)}
+    //                 className="rounded-full border px-3 py-1 text-xs font-semibold"
+    //                 style={{
+    //                   backgroundColor: showFlightPath ? `${color.orange}22` : color.card,
+    //                   borderColor: showFlightPath ? color.orange : color.border,
+    //                   color: showFlightPath ? color.text : color.textMuted,
+    //                 }}
+    //               >
+    //                 Flight Path
+    //               </button>
+    //               {showTargetSwitch ? (
+    //                 <button
+    //                   type="button"
+    //                   onClick={() => setShowTargetMarkers((previous) => !previous)}
+    //                   className="rounded-full border px-3 py-1 text-xs font-semibold"
+    //                   style={{
+    //                     backgroundColor: showTargetMarkers ? `${(color.yellow || "#facc15")}22` : color.card,
+    //                     borderColor: showTargetMarkers ? color.yellow || "#facc15" : color.border,
+    //                     color: showTargetMarkers ? color.text : color.textMuted,
+    //                   }}
+    //                 >
+    //                   Target Markers
+    //                 </button>
+    //               ) : null}
+    //             </>
+    //           ) : null}
+
+    //           <button
+    //             type="button"
+    //             onClick={() => onToggleAllPlottedData?.()}
+    //             className="rounded-full border px-3 py-1 text-xs font-semibold"
+    //             style={{
+    //               backgroundColor: showAllPlottedData ? `${color.green}22` : color.card,
+    //               borderColor: showAllPlottedData ? color.green : color.border,
+    //               color: showAllPlottedData ? color.text : color.textMuted,
+    //             }}
+    //           >
+    //             All Data
+    //           </button>
+
+    //           {devices.map((device) => {
+    //             const isVisible = showAllPlottedData && droneVisibilityById[device.id] !== false;
+    //             const deviceColor = getDroneColor(device.id);
+    //             return (
+    //               <button
+    //                 key={device.id}
+    //                 type="button"
+    //                 onClick={() => onToggleDroneVisibility?.(device.id)}
+    //                 className="rounded-full border px-3 py-1 text-xs font-semibold"
+    //                 style={{
+    //                   backgroundColor: isVisible ? `${deviceColor}22` : color.card,
+    //                   borderColor: isVisible ? deviceColor : color.border,
+    //                   color: isVisible ? color.text : color.textMuted,
+    //                 }}
+    //               >
+    //                 {device.name}
+    //               </button>
+    //             );
+    //           })}
+
+    //           <button
+    //             type="button"
+    //             onClick={() => onToggleMethaneValidity?.("valid")}
+    //             className="rounded-full border px-3 py-1 text-xs font-semibold"
+    //             style={{
+    //               backgroundColor: methaneValidityVisibility.valid ? `${color.green}22` : color.card,
+    //               borderColor: methaneValidityVisibility.valid ? color.green : color.border,
+    //               color: methaneValidityVisibility.valid ? color.text : color.textMuted,
+    //             }}
+    //           >
+    //             Valid (1)
+    //           </button>
+    //           <button
+    //             type="button"
+    //             onClick={() => onToggleMethaneValidity?.("invalid")}
+    //             className="rounded-full border px-3 py-1 text-xs font-semibold"
+    //             style={{
+    //               backgroundColor: methaneValidityVisibility.invalid ? `${color.orange}22` : color.card,
+    //               borderColor: methaneValidityVisibility.invalid ? color.orange : color.border,
+    //               color: methaneValidityVisibility.invalid ? color.text : color.textMuted,
+    //             }}
+    //           >
+    //             Invalid (2)
+    //           </button>
+    //           <button
+    //             type="button"
+    //             onClick={() => onToggleMethaneValidity?.("noData")}
+    //             className="rounded-full border px-3 py-1 text-xs font-semibold"
+    //             style={{
+    //               backgroundColor: methaneValidityVisibility.noData ? `${color.textMuted}22` : color.card,
+    //               borderColor: methaneValidityVisibility.noData ? color.textMuted : color.border,
+    //               color: methaneValidityVisibility.noData ? color.text : color.textMuted,
+    //             }}
+    //           >
+    //             No Data (0)
+    //           </button>
+
+    //           {resultsPageMode ? (
+    //             <>
+    //               <button
+    //                 type="button"
+    //                 onClick={() => onToggleHeatmap?.()}
+    //                 className="rounded-full border px-3 py-1 text-xs font-semibold"
+    //                 style={{
+    //                   backgroundColor: heatmapEnabled ? `${color.green}22` : color.card,
+    //                   borderColor: heatmapEnabled ? color.green : color.border,
+    //                   color: heatmapEnabled ? color.text : color.textMuted,
+    //                 }}
+    //               >
+    //                 Heatmap
+    //               </button>
+    //               <button
+    //                 type="button"
+    //                 onClick={() => onTogglePlumeView?.()}
+    //                 className="rounded-full border px-3 py-1 text-xs font-semibold"
+    //                 style={{
+    //                   backgroundColor: plumeViewEnabled ? `${color.orange}22` : color.card,
+    //                   borderColor: plumeViewEnabled ? color.orange : color.border,
+    //                   color: plumeViewEnabled ? color.text : color.textMuted,
+    //                 }}
+    //               >
+    //                 Plume View
+    //               </button>
+    //             </>
+    //           ) : null}
+    //         </div>
+
+    //         <div className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_220px]">
+    //           <div
+    //             ref={mapContainerRef}
+    //             className={`w-full rounded-lg ${resultsPageMode ? "min-h-[590px]" : "border min-h-[460px]"}`}
+    //             style={resultsPageMode ? undefined : { borderColor: color.border }}
+    //           />
+
+    //           <div className="flex flex-col gap-3">
+    //             <div className="rounded-lg border p-3" style={{ backgroundColor: color.surface, borderColor: color.border }}>
+    //               <div className="text-xs uppercase tracking-[0.12em]" style={{ color: color.textMuted }}>
+    //                 Telemetry
+    //               </div>
+    //               <div className="mt-2 space-y-1 text-sm" style={{ color: color.text }}>
+    //                 <div>lat: {displayLatitude.toFixed(4)} deg N</div>
+    //                 <div>lon: {Math.abs(displayLongitude).toFixed(4)} deg W</div>
+    //                 <div>alt: {displayAltitude.toFixed(1)} m</div>
+    //                 <div>drones: {droneStates.length}</div>
+    //                 <div>trace points: {tracePointCount}</div>
+    //               </div>
+    //             </div>
+
+    //             <div className="flex h-full min-w-[100px] items-center gap-3">
+    //             <div className="flex h-[292px] items-stretch gap-2">
+    //               <div
+    //                 className="w-5 rounded-[4px] border shadow-[inset_0_0_0_1px_rgba(255,255,255,0.08)]"
+    //                 style={{
+    //                   background: methaneGradient,
+    //                   borderColor: color.border,
+    //                 }}
+    //               />
+    //               <div className="flex h-full flex-col justify-between py-[2px]">
+    //                 {methaneScale.map((entry) => (
+    //                   <div key={entry.id} className="flex items-center gap-1.5">
+    //                     <span
+    //                       className="block h-px w-2"
+    //                       style={{ backgroundColor: color.textMuted }}
+    //                     />
+
+    //                     {entry.kind === "upper" ? (
+    //                       <input
+    //                         type="number"
+    //                         step="0.1"
+    //                         value={upperLimitInput}
+    //                         onChange={(event) =>
+    //                           handleLimitChange("upper", event.target.value)
+    //                         }
+    //                         onBlur={() => commitLimit("upper")}
+    //                         className="w-14 rounded-sm border bg-transparent px-1 py-0.5 text-[10px] font-semibold leading-none outline-none"
+    //                         style={{ borderColor: color.border, color: color.text }}
+    //                         aria-label="Upper methane scale limit"
+    //                       />
+    //                     ) : null}
+
+    //                     {entry.kind === "range" ? (
+    //                       <span
+    //                         className="text-[10px] font-semibold leading-none"
+    //                         style={{ color: color.text }}
+    //                       >
+    //                         {entry.label}
+    //                       </span>
+    //                     ) : null}
+
+    //                     {entry.kind === "lower" ? (
+    //                       <input
+    //                         type="number"
+    //                         step="0.1"
+    //                         value={lowerLimitInput}
+    //                         onChange={(event) =>
+    //                           handleLimitChange("lower", event.target.value)
+    //                         }
+    //                         onBlur={() => commitLimit("lower")}
+    //                         className="w-14 rounded-sm border bg-transparent px-1 py-0.5 text-[10px] font-semibold leading-none outline-none"
+    //                         style={{ borderColor: color.border, color: color.text }}
+    //                         aria-label="Lower methane scale limit"
+    //                       />
+    //                     ) : null}
+    //                   </div>
+    //                 ))}
+    //               </div>
+    //             </div>
+    //           </div>
+    //           </div>
+    //         </div>
+
+    //         <div className="flex items-center justify-between text-sm" style={{ color: color.textMuted }}>
+    //           <span>Upper/Lower limits update the deck.gl heatmap and point colors.</span>
+    //           <span>{methaneScale.map((entry) => entry.label).join(" | ")}</span>
+    //         </div>
+    //       </div>
+    //     </div>
+    //   );
+    return (
+        <div
+            className={tw.panel}
+            style={{ backgroundColor: color.card, padding: "0.5rem" }}
+        >
+            <div className="flex h-full w-full flex-col gap-3">
+                <div
+                    className={`grid grid-cols-1 gap-3 xl:items-start ${resultsPageMode
+                        ? "xl:grid-cols-1"
+                        : "xl:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)]"
+                        }`}
+                >
+                    {!resultsPageMode ? (
+                        <div className="flex flex-col gap-3 rounded-lg px-3 py-2"
+                        >
+                            <div className="flex flex-col justify-start items-start">
+                                <p
+                                    className="text-xs uppercase tracking-[0.18em]"
+                                    style={{ color: color.green }}
+                                >
+                                    Position
+                                </p>
+                                <h3
+                                    className="text-xl font-bold tracking-tight"
+                                    style={{ color: color.text }}
+                                >
+                                    Drone satellite view
+                                </h3>
+
+                                <div className="mt-1 flex flex-wrap justify-start items-center gap-3">
+                                    <div
+                                        className="flex items-center gap-2 rounded-full border px-2 py-1"
+                                        style={{ borderColor: color.border }}
+                                    >
+                                        <button
+                                            type="button"
+                                            onClick={() =>
+                                                setIsAutoCenterEnabled((previous) => !previous)
+                                            }
+                                            className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-300 ease-in-out focus:outline-none ${isAutoCenterEnabled ? "bg-cyan-500" : "bg-gray-300"}`}
+                                        >
+                                            <span
+                                                className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition-transform duration-300 ease-in-out ${isAutoCenterEnabled ? "translate-x-5" : "translate-x-0"}`}
+                                            />
+                                        </button>
+                                        <span className="text-sm" style={{ color: color.textMuted }}>
+                                            Center on Drone
+                                        </span>
+                                    </div>
+
+                                    <div
+                                        className="flex items-center gap-2 rounded-full border px-2 py-1"
+                                        style={{ borderColor: color.border }}
+                                    >
+                                        <button
+                                            type="button"
+                                            onClick={() => setShowFlightPath((previous) => !previous)}
+                                            className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-300 ease-in-out focus:outline-none ${showFlightPath ? "bg-orange-500" : "bg-gray-300"}`}
+                                        >
+                                            <span
+                                                className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition-transform duration-300 ease-in-out ${showFlightPath ? "translate-x-5" : "translate-x-0"}`}
+                                            />
+                                        </button>
+                                        <span className="text-sm" style={{ color: color.textMuted }}>
+                                            Flight Path
+                                        </span>
+                                    </div>
+
+                                    <div
+                                        className="flex items-center gap-2 rounded-full border px-2 py-1"
+                                        style={{ borderColor: color.border }}
+                                    >
+                                        <button
+                                            type="button"
+                                            onClick={() => setShowTargetMarkers((previous) => !previous)}
+                                            className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-300 ease-in-out focus:outline-none ${showTargetMarkers ? "bg-yellow-400" : "bg-gray-300"}`}
+                                        >
+                                            <span
+                                                className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition-transform duration-300 ease-in-out ${showTargetMarkers ? "translate-x-5" : "translate-x-0"}`}
+                                            />
+                                        </button>
+                                        <span className="text-sm" style={{ color: color.textMuted }}>
+                                            Target Markers
+                                        </span>
+                                    </div>
+                                </div>
+
+                            </div>
+                        </div>
+                    ) : null}
+                    <div className="flex flex-col gap-2 rounded-lg border px-3 py-2 mt-5 "
+                        style={{ backgroundColor: color.surface, borderColor: color.border }}
+                    >
+                        {!resultsPageMode ? (
+                            <div className="flex flex-col gap-2">
+                                <div className="flex flex-wrap items-center gap-2">
+                                    <button
+                                        type="button"
+                                        onClick={() => onToggleAllPlottedData?.()}
+                                        className="relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-300 ease-in-out focus:outline-none"
+                                        style={{
+                                            backgroundColor: showAllPlottedData
+                                                ? color.green
+                                                : color.borderStrong,
+                                        }}
+                                        aria-label="Toggle all map plotted data"
+                                    >
+                                        <span
+                                            className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition-transform duration-300 ease-in-out ${showAllPlottedData ? "translate-x-5" : "translate-x-0"}`}
+                                        />
+                                    </button>
+                                    <span className="text-sm font-semibold" style={{ color: color.text }}>
+                                        Map Data
+                                    </span>
+
+                                    <div className="flex flex-wrap gap-1.5">
+                                        {devices.map((device) => {
+                                            const isVisible =
+                                                showAllPlottedData &&
+                                                droneVisibilityById[device.id] !== false;
+                                            const deviceColor = getDroneColor(device.id);
+
+                                            return (
+                                                <button
+                                                    key={device.id}
+                                                    type="button"
+                                                    onClick={() => onToggleDroneVisibility?.(device.id)}
+                                                    className="inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-semibold transition-colors"
+                                                    style={{
+                                                        backgroundColor: isVisible
+                                                            ? `${deviceColor}22`
+                                                            : color.card,
+                                                        borderColor: isVisible ? deviceColor : color.border,
+                                                        color: isVisible ? color.text : color.textMuted,
+                                                    }}
+                                                >
+                                                    <span
+                                                        className="h-2 w-2 rounded-full"
+                                                        style={{ backgroundColor: deviceColor }}
+                                                    />
+                                                    {device.name}
+                                                </button>
+                                            );
+                                        })}
+                                    </div>
+                                </div>
+
+                                <div className="flex flex-wrap items-center gap-1.5">
+                                    <span
+                                        className="text-xs font-semibold uppercase tracking-[0.12em]"
+                                        style={{ color: color.textMuted }}
+                                    >
+                                        Methane Valid
+                                    </span>
+                                    <button
+                                        type="button"
+                                        onClick={() => onToggleMethaneValidity?.("valid")}
+                                        className="inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-semibold transition-colors"
+                                        style={{
+                                            backgroundColor: methaneValidityVisibility.valid
+                                                ? `${color.green}22`
+                                                : color.card,
+                                            borderColor: methaneValidityVisibility.valid
+                                                ? color.green
+                                                : color.border,
+                                            color: methaneValidityVisibility.valid
+                                                ? color.text
+                                                : color.textMuted,
+                                        }}
+                                    >
+                                        Valid (1)
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => onToggleMethaneValidity?.("invalid")}
+                                        className="inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-semibold transition-colors"
+                                        style={{
+                                            backgroundColor: methaneValidityVisibility.invalid
+                                                ? `${color.orange}22`
+                                                : color.card,
+                                            borderColor: methaneValidityVisibility.invalid
+                                                ? color.orange
+                                                : color.border,
+                                            color: methaneValidityVisibility.invalid
+                                                ? color.text
+                                                : color.textMuted,
+                                        }}
+                                    >
+                                        Invalid (2)
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => onToggleMethaneValidity?.("noData")}
+                                        className="inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-semibold transition-colors"
+                                        style={{
+                                            backgroundColor: methaneValidityVisibility.noData
+                                                ? `${color.textMuted}22`
+                                                : color.card,
+                                            borderColor: methaneValidityVisibility.noData
+                                                ? color.textMuted
+                                                : color.border,
+                                            color: methaneValidityVisibility.noData
+                                                ? color.text
+                                                : color.textMuted,
+                                        }}
+                                    >
+                                        No Data (0)
+                                    </button>
+
+                                </div>
+                            </div>
+                        ) : null}
+
+                        <div className="flex w-full flex-col gap-2 pt-1">
+                            {resultsPageMode ? (
+                                <div className="flex flex-wrap items-center gap-3">
+                                    <div
+                                        className="flex items-center gap-2 rounded-full border px-2 py-1"
+                                        style={{ borderColor: color.border }}
+                                    >
+                                        <button
+                                            type="button"
+                                            onClick={() => onToggleHeatmap?.()}
+                                            className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-300 ease-in-out focus:outline-none ${heatmapEnabled ? "bg-sky-500" : "bg-gray-300"}`}
+                                        >
+                                            <span
+                                                className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition-transform duration-300 ease-in-out ${heatmapEnabled ? "translate-x-5" : "translate-x-0"}`}
+                                            />
+                                        </button>
+                                        <span className="text-sm" style={{ color: color.textMuted }}>
+                                            Heatmap
+                                        </span>
+                                    </div>
+
+                                    <div
+                                        className="flex items-center gap-2 rounded-full border px-2 py-1"
+                                        style={{ borderColor: color.border }}
+                                    >
+                                        <button
+                                            type="button"
+                                            onClick={() => onTogglePlumeView?.()}
+                                            className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-300 ease-in-out focus:outline-none ${plumeViewEnabled ? "bg-green-600" : "bg-gray-300"}`}
+                                        >
+                                            <span
+                                                className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition-transform duration-300 ease-in-out ${plumeViewEnabled ? "translate-x-5" : "translate-x-0"}`}
+                                            />
+                                        </button>
+                                        <span className="text-sm" style={{ color: color.textMuted }}>
+                                            Plume View
+                                        </span>
+                                    </div>
+
+                                    <div
+                                        className="flex items-center gap-2 rounded-full border px-2 py-1"
+                                        style={{ borderColor: color.border }}
+                                    >
+                                        <span className="text-xs" style={{ color: color.textMuted }}>
+                                            Methane Valid
+                                        </span>
+                                        <button
+                                            type="button"
+                                            onClick={() => onToggleMethaneValidity?.("valid")}
+                                            className="rounded-full border px-2.5 py-1 text-xs font-semibold transition-colors"
+                                            style={{
+                                                backgroundColor: methaneValidityVisibility.valid
+                                                    ? `${color.green}22`
+                                                    : color.card,
+                                                borderColor: methaneValidityVisibility.valid
+                                                    ? color.green
+                                                    : color.border,
+                                                color: methaneValidityVisibility.valid
+                                                    ? color.text
+                                                    : color.textMuted,
+                                            }}
+                                        >
+                                            1
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={() => onToggleMethaneValidity?.("invalid")}
+                                            className="rounded-full border px-2.5 py-1 text-xs font-semibold transition-colors"
+                                            style={{
+                                                backgroundColor: methaneValidityVisibility.invalid
+                                                    ? `${color.orange}22`
+                                                    : color.card,
+                                                borderColor: methaneValidityVisibility.invalid
+                                                    ? color.orange
+                                                    : color.border,
+                                                color: methaneValidityVisibility.invalid
+                                                    ? color.text
+                                                    : color.textMuted,
+                                            }}
+                                        >
+                                            2
+                                        </button>
+                                        <button
+                                            type="button"
+                                            onClick={() => onToggleMethaneValidity?.("noData")}
+                                            className="rounded-full border px-2.5 py-1 text-xs font-semibold transition-colors"
+                                            style={{
+                                                backgroundColor: methaneValidityVisibility.noData
+                                                    ? `${color.textMuted}22`
+                                                    : color.card,
+                                                borderColor: methaneValidityVisibility.noData
+                                                    ? color.textMuted
+                                                    : color.border,
+                                                color: methaneValidityVisibility.noData
+                                                    ? color.text
+                                                    : color.textMuted,
+                                            }}
+                                        >
+                                            0
+                                        </button>
+                                    </div>
+                                </div>
+                            ) : null}
+
+                            {resultsPageMode ? (
+                                <div className="flex flex-wrap items-center gap-3">
+                                    <div
+                                        className="flex items-center gap-2 rounded-full border px-2 py-1"
+                                        style={{ borderColor: color.border }}
+                                    >
+                                        <button
+                                            type="button"
+                                            onClick={() =>
+                                                setIsAutoCenterEnabled((previous) => !previous)
+                                            }
+                                            className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-300 ease-in-out focus:outline-none ${isAutoCenterEnabled ? "bg-cyan-500" : "bg-gray-300"}`}
+                                        >
+                                            <span
+                                                className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition-transform duration-300 ease-in-out ${isAutoCenterEnabled ? "translate-x-5" : "translate-x-0"}`}
+                                            />
+                                        </button>
+                                        <span className="text-sm" style={{ color: color.textMuted }}>
+                                            Auto Center
+                                        </span>
+                                    </div>
+
+                                    <div
+                                        className="flex items-center gap-2 rounded-full border px-2 py-1"
+                                        style={{ borderColor: color.border }}
+                                    >
+                                        <button
+                                            type="button"
+                                            onClick={() => setShowFlightPath((previous) => !previous)}
+                                            className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-300 ease-in-out focus:outline-none ${showFlightPath ? "bg-orange-500" : "bg-gray-300"}`}
+                                        >
+                                            <span
+                                                className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition-transform duration-300 ease-in-out ${showFlightPath ? "translate-x-5" : "translate-x-0"}`}
+                                            />
+                                        </button>
+                                        <span className="text-sm" style={{ color: color.textMuted }}>
+                                            Flight Path
+                                        </span>
+                                    </div>
+
+                                    <div
+                                        className="flex items-center gap-2 rounded-full border px-2 py-1"
+                                        style={{ borderColor: color.border }}
+                                    >
+                                        <button
+                                            type="button"
+                                            onClick={() => setShowTargetMarkers((previous) => !previous)}
+                                            className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-300 ease-in-out focus:outline-none ${showTargetMarkers ? "bg-yellow-400" : "bg-gray-300"}`}
+                                        >
+                                            <span
+                                                className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition-transform duration-300 ease-in-out ${showTargetMarkers ? "translate-x-5" : "translate-x-0"}`}
+                                            />
+                                        </button>
+                                        <span className="text-sm" style={{ color: color.textMuted }}>
+                                            Target Markers
+                                        </span>
+                                    </div>
+                                </div>
+                            ) : null}
+                        </div>
+                    </div>
+                </div>
+                <div className="flex flex-row justify-between items-center">
+                    <div
+                        className="my-1 flex flex-wrap gap-x-4 gap-y-2 text-sm"
+                        style={{ color: color.textMuted }}
+                    >
+                        <span>lat: {displayLatitude.toFixed(4)} deg N</span>
+                        <span>lon: {Math.abs(displayLongitude).toFixed(4)} deg W</span>
+                        <span>alt: {displayAltitude.toFixed(1)} m</span>
+                        <span>drones: {droneStates.length}</span>
+                    </div>
+                    <div
+                        className="rounded-full px-3 py-1 text-xs font-medium flex items-center"
+                        style={{
+                            backgroundColor: isTelemetryConnected
+                                ? color.orangeSoft
+                                : color.surface,
+                            color: isTelemetryConnected ? color.orange : color.textMuted,
+                        }}
+                    >
+                        {isTelemetryConnected ? "Live telemetry" : "Waiting telemetry"} •{" "}
+                        {mapMode}
+                    </div>
+                </div>
+                <div className="flex items-stretch gap-2">
+                    <div
+                        ref={mapContainerRef}
+                        className={` w-full rounded-lg ${resultsPageMode ? "min-h-[590px]" : "border min-h-[460px]"}`}
+                        style={resultsPageMode ? undefined : { borderColor: color.border }}
+                    />
+
+                    <div className="flex h-full min-w-[100px] items-center gap-3">
+                        <div className="flex h-[292px] items-stretch gap-2">
+                            <div
+                                className="w-5 rounded-[4px] border shadow-[inset_0_0_0_1px_rgba(255,255,255,0.08)]"
+                                style={{
+                                    background: methaneGradient,
+                                    borderColor: color.border,
+                                }}
+                            />
+                            <div className="flex h-full flex-col justify-between py-[2px]">
+                                {methaneScale.map((entry) => (
+                                    <div key={entry.id} className="flex items-center gap-1.5">
+                                        <span
+                                            className="block h-px w-2"
+                                            style={{ backgroundColor: color.textMuted }}
+                                        />
+
+                                        {entry.kind === "upper" ? (
+                                            <input
+                                                type="number"
+                                                step="0.1"
+                                                value={upperLimitInput}
+                                                onChange={(event) =>
+                                                    handleLimitChange("upper", event.target.value)
+                                                }
+                                                onBlur={() => commitLimit("upper")}
+                                                className="w-14 rounded-sm border bg-transparent px-1 py-0.5 text-[10px] font-semibold leading-none outline-none"
+                                                style={{ borderColor: color.border, color: color.text }}
+                                                aria-label="Upper methane scale limit"
+                                            />
+                                        ) : null}
+
+                                        {entry.kind === "range" ? (
+                                            <span
+                                                className="text-[10px] font-semibold leading-none"
+                                                style={{ color: color.text }}
+                                            >
+                                                {entry.label}
+                                            </span>
+                                        ) : null}
+
+                                        {entry.kind === "lower" ? (
+                                            <input
+                                                type="number"
+                                                step="0.1"
+                                                value={lowerLimitInput}
+                                                onChange={(event) =>
+                                                    handleLimitChange("lower", event.target.value)
+                                                }
+                                                onBlur={() => commitLimit("lower")}
+                                                className="w-14 rounded-sm border bg-transparent px-1 py-0.5 text-[10px] font-semibold leading-none outline-none"
+                                                style={{ borderColor: color.border, color: color.text }}
+                                                aria-label="Lower methane scale limit"
+                                            />
+                                        ) : null}
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    );
+}

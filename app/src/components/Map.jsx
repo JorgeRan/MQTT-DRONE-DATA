@@ -1,5 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import mapboxgl from "mapbox-gl";
+// import { Map, NavigationControl, Popup, useControl } from "react-map-gl/mapbox";
+import {GeoJsonLayer, ArcLayer} from 'deck.gl';
 import satelliteImage from "../assets/satellite.png";
 import { tw, color } from "../constants/tailwind";
 import {
@@ -661,6 +663,12 @@ export function Map({
       attributionControl: false,
     });
 
+    function DeckGLOverlay(props) {
+      const overlay = useControl(() => new DeckOverlay(props));
+      overlay.setProps(props);
+      return null;
+    }
+
     setMapMode(isOnlineMode ? "online" : "offline");
     mapRef.current = map;
     popupRef.current = new mapboxgl.Popup({
@@ -672,7 +680,7 @@ export function Map({
 
     map.addControl(new mapboxgl.NavigationControl(), "top-right");
 
-
+    
 
     map.on("load", () => {
       if (!isOnlineMode && !resultsPageMode) {
@@ -1732,70 +1740,70 @@ export function Map({
                 >
                   Position
                 </p>
-                <p
+                <h3
                   className="text-xl font-bold tracking-tight"
                   style={{ color: color.text }}
                 >
                   Drone satellite view
+                </h3>
 
-                  <div className="flex flex-wrap justify-start items-center gap-3 mt-1">
-                    <div
-                      className="flex items-center gap-2 rounded-full border px-2 py-1"
-                      style={{ borderColor: color.border }}
+                <div className="mt-1 flex flex-wrap justify-start items-center gap-3">
+                  <div
+                    className="flex items-center gap-2 rounded-full border px-2 py-1"
+                    style={{ borderColor: color.border }}
+                  >
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setIsAutoCenterEnabled((previous) => !previous)
+                      }
+                      className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-300 ease-in-out focus:outline-none ${isAutoCenterEnabled ? "bg-cyan-500" : "bg-gray-300"}`}
                     >
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setIsAutoCenterEnabled((previous) => !previous)
-                        }
-                        className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-300 ease-in-out focus:outline-none ${isAutoCenterEnabled ? "bg-cyan-500" : "bg-gray-300"}`}
-                      >
-                        <span
-                          className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition-transform duration-300 ease-in-out ${isAutoCenterEnabled ? "translate-x-5" : "translate-x-0"}`}
-                        />
-                      </button>
-                      <span className="text-sm" style={{ color: color.textMuted }}>
-                        Center on Drone
-                      </span>
-                    </div>
-
-                    <div
-                      className="flex items-center gap-2 rounded-full border px-2 py-1"
-                      style={{ borderColor: color.border }}
-                    >
-                      <button
-                        type="button"
-                        onClick={() => setShowFlightPath((previous) => !previous)}
-                        className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-300 ease-in-out focus:outline-none ${showFlightPath ? "bg-orange-500" : "bg-gray-300"}`}
-                      >
-                        <span
-                          className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition-transform duration-300 ease-in-out ${showFlightPath ? "translate-x-5" : "translate-x-0"}`}
-                        />
-                      </button>
-                      <span className="text-sm" style={{ color: color.textMuted }}>
-                        Flight Path
-                      </span>
-                    </div>
-
-                    <div
-                      className="flex items-center gap-2 rounded-full border px-2 py-1"
-                      style={{ borderColor: color.border }}
-                    >
-                      <button
-                        type="button"
-                        onClick={() => setShowTargetMarkers((previous) => !previous)}
-                        className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-300 ease-in-out focus:outline-none ${showTargetMarkers ? "bg-yellow-400" : "bg-gray-300"}`}
-                      >
-                        <span
-                          className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition-transform duration-300 ease-in-out ${showTargetMarkers ? "translate-x-5" : "translate-x-0"}`}
-                        />
-                      </button>
-                      <span className="text-sm" style={{ color: color.textMuted }}>
-                        Target Markers
-                      </span>
-                    </div>
+                      <span
+                        className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition-transform duration-300 ease-in-out ${isAutoCenterEnabled ? "translate-x-5" : "translate-x-0"}`}
+                      />
+                    </button>
+                    <span className="text-sm" style={{ color: color.textMuted }}>
+                      Center on Drone
+                    </span>
                   </div>
-                </p>
+
+                  <div
+                    className="flex items-center gap-2 rounded-full border px-2 py-1"
+                    style={{ borderColor: color.border }}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => setShowFlightPath((previous) => !previous)}
+                      className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-300 ease-in-out focus:outline-none ${showFlightPath ? "bg-orange-500" : "bg-gray-300"}`}
+                    >
+                      <span
+                        className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition-transform duration-300 ease-in-out ${showFlightPath ? "translate-x-5" : "translate-x-0"}`}
+                      />
+                    </button>
+                    <span className="text-sm" style={{ color: color.textMuted }}>
+                      Flight Path
+                    </span>
+                  </div>
+
+                  <div
+                    className="flex items-center gap-2 rounded-full border px-2 py-1"
+                    style={{ borderColor: color.border }}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => setShowTargetMarkers((previous) => !previous)}
+                      className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-300 ease-in-out focus:outline-none ${showTargetMarkers ? "bg-yellow-400" : "bg-gray-300"}`}
+                    >
+                      <span
+                        className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition-transform duration-300 ease-in-out ${showTargetMarkers ? "translate-x-5" : "translate-x-0"}`}
+                      />
+                    </button>
+                    <span className="text-sm" style={{ color: color.textMuted }}>
+                      Target Markers
+                    </span>
+                  </div>
+                </div>
 
               </div>
             </div>

@@ -14,6 +14,7 @@ import { DataPage } from "./components/DataPage";
 import { ResultsPage } from "./components/ResultsPage";
 import { MeasurementControls } from "./components/MeasurementControls";
 import { MissionModal } from "./components/MissionModal";
+import {DeckMap} from "./components/DeckMap";
 import {
   filterTraceDatasetBySelection,
   flowChartData,
@@ -334,7 +335,8 @@ const buildTraceDatasetFromFlowData = (datasetFlowData) => ({
   features: filterCoordinateOutliers(datasetFlowData)
     .filter((point) => {
       return Number.isFinite(point.latitude) && Number.isFinite(point.longitude);
-    }).slice(-5000)
+    })
+    // .slice(-5000)
     .map((point) => {
       const sourceLatitude = point.latitude;
       const sourceLongitude = point.longitude;
@@ -379,53 +381,81 @@ const buildTraceDatasetFromFlowData = (datasetFlowData) => ({
     }),
 });
 
-const appendFlowPoint = (series, telemetryRow) => {
+const appendFlowPoints = (series, telemetryRows, options = {}) => {
   const existingSeries = series || [];
+  const rows = Array.isArray(telemetryRows) ? telemetryRows : [];
+  const maxPoints = Number.isFinite(options.maxPoints)
+    ? Math.max(0, options.maxPoints)
+    : null;
 
-  if (!shouldDisplayTelemetry(telemetryRow)) {
+  if (rows.length === 0) {
     return existingSeries;
   }
 
-  const nextTimestampMs = new Date(telemetryRow.ts || Date.now()).getTime();
-  const lastPoint = existingSeries[existingSeries.length - 1] || null;
+  let changed = false;
+  let nextSeries = existingSeries;
 
-  // Fast path for ordered telemetry streams (the common case).
-  if (!lastPoint || nextTimestampMs >= lastPoint.timestampMs) {
-    const nextPoint = buildFlowPointFromTelemetry(
-      telemetryRow,
-      existingSeries.length,
-    );
-    return [...existingSeries, nextPoint];
-  }
+  const insertAtTimestamp = (nextTimestampMs, telemetryRow) => {
+    let low = 0;
+    let high = nextSeries.length;
 
-  // Keep stable ordering when an out-of-order packet arrives.
-  let low = 0;
-  let high = existingSeries.length;
-
-  while (low < high) {
-    const midpoint = Math.floor((low + high) / 2);
-    if (existingSeries[midpoint].timestampMs <= nextTimestampMs) {
-      low = midpoint + 1;
-    } else {
-      high = midpoint;
+    while (low < high) {
+      const midpoint = Math.floor((low + high) / 2);
+      if (nextSeries[midpoint].timestampMs <= nextTimestampMs) {
+        low = midpoint + 1;
+      } else {
+        high = midpoint;
+      }
     }
+
+    const insertionIndex = low;
+    nextSeries.splice(
+      insertionIndex,
+      0,
+      buildFlowPointFromTelemetry(telemetryRow, insertionIndex),
+    );
+
+    for (let index = insertionIndex + 1; index < nextSeries.length; index += 1) {
+      const point = nextSeries[index];
+      nextSeries[index] = {
+        ...point,
+        sampleOrder: index,
+        sampleIndex: index + 1,
+      };
+    }
+  };
+
+  rows.forEach((telemetryRow) => {
+    if (!shouldDisplayTelemetry(telemetryRow)) {
+      return;
+    }
+
+    if (!changed) {
+      nextSeries = existingSeries.slice();
+      changed = true;
+    }
+
+    const nextTimestampMs = new Date(telemetryRow.ts || Date.now()).getTime();
+    const lastPoint = nextSeries[nextSeries.length - 1] || null;
+
+    if (!lastPoint || nextTimestampMs >= lastPoint.timestampMs) {
+      nextSeries.push(buildFlowPointFromTelemetry(telemetryRow, nextSeries.length));
+      return;
+    }
+
+    insertAtTimestamp(nextTimestampMs, telemetryRow);
+  });
+
+  if (!changed) {
+    return existingSeries;
   }
 
-  const insertionIndex = low;
-  const nextSeries = existingSeries.slice();
-  nextSeries.splice(
-    insertionIndex,
-    0,
-    buildFlowPointFromTelemetry(telemetryRow, insertionIndex),
-  );
-
-  for (let index = insertionIndex; index < nextSeries.length; index += 1) {
-    const point = nextSeries[index];
-    nextSeries[index] = {
+  if (maxPoints !== null && nextSeries.length > maxPoints) {
+    nextSeries = nextSeries.slice(nextSeries.length - maxPoints).map((point, index) => ({
       ...point,
       sampleOrder: index,
       sampleIndex: index + 1,
-    };
+    }));
   }
 
   return nextSeries;
@@ -473,6 +503,8 @@ const HOLD_DELAY = 2000;
 const MOVEMENT_THRESHOLD_METERS = 1.5;
 const START_MISSION_PROMPT_COOLDOWN_MS = 45000;
 const START_MISSION_PROMPT_SNOOZE_AFTER_SAVE_MS = 120000;
+const TELEMETRY_FLUSH_INTERVAL_MS = 120;
+const LIVE_TELEMETRY_RENDER_LIMIT = 4000;
 
 function App() {
   const [currentView, setCurrentView] = useState("dashboard");
@@ -637,6 +669,87 @@ function App() {
   useEffect(() => {
     let socket;
     let reconnectTimer;
+    let flushTimer;
+    const queuedTelemetryByDrone = new globalThis.Map();
+
+    const flushQueuedTelemetry = () => {
+      flushTimer = null;
+
+      if (queuedTelemetryByDrone.size === 0) {
+        return;
+      }
+
+      const queuedEntries = Array.from(queuedTelemetryByDrone.entries());
+      queuedTelemetryByDrone.clear();
+
+      setLiveTelemetryByDrone((previous) => {
+        let changed = false;
+        const next = { ...previous };
+
+        queuedEntries.forEach(([droneId, telemetryRows]) => {
+          const currentSeries = previous[droneId] || [];
+          const updatedSeries = appendFlowPoints(currentSeries, telemetryRows, {
+            maxPoints: LIVE_TELEMETRY_RENDER_LIMIT,
+          });
+
+          if (updatedSeries !== currentSeries) {
+            next[droneId] = updatedSeries;
+            changed = true;
+          }
+        });
+
+        return changed ? next : previous;
+      });
+
+      setRecordedFlowDataByDrone((previous) => {
+        let changed = false;
+        const next = { ...previous };
+
+        queuedEntries.forEach(([droneId, telemetryRows]) => {
+          const currentSeries = previous[droneId] || [];
+          const updatedSeries = appendFlowPoints(currentSeries, telemetryRows);
+
+          if (updatedSeries !== currentSeries) {
+            next[droneId] = updatedSeries;
+            changed = true;
+          }
+        });
+
+        return changed ? next : previous;
+      });
+
+      if (measurementStatusRef.current === "running") {
+        setMeasurementTraceByDrone((previous) => {
+          let changed = false;
+          const next = { ...previous };
+
+          queuedEntries.forEach(([droneId, telemetryRows]) => {
+            const currentSeries = previous[droneId] || [];
+            const updatedSeries = appendFlowPoints(currentSeries, telemetryRows);
+
+            if (updatedSeries !== currentSeries) {
+              next[droneId] = updatedSeries;
+              changed = true;
+            }
+          });
+
+          return changed ? next : previous;
+        });
+      }
+    };
+
+    const enqueueTelemetry = (droneId, telemetryRow) => {
+      const existingRows = queuedTelemetryByDrone.get(droneId) || [];
+      existingRows.push(telemetryRow);
+      queuedTelemetryByDrone.set(droneId, existingRows);
+
+      if (!flushTimer) {
+        flushTimer = window.setTimeout(
+          flushQueuedTelemetry,
+          TELEMETRY_FLUSH_INTERVAL_MS,
+        );
+      }
+    };
 
     const connectTelemetrySocket = () => {
       if (reconnectTimer) {
@@ -688,16 +801,12 @@ function App() {
               }
 
               telemetrySourceByDroneRef.current[droneId] = source;
-              setTelemetrySource(source);
+              if (previousSource !== source) {
+                setTelemetrySource(source);
+              }
             }
 
-            setLiveTelemetryByDrone((previous) => ({
-              ...previous,
-              [droneId]: appendFlowPoint(
-                previous[droneId],
-                packetDataForSeries,
-              ),
-            }));
+            enqueueTelemetry(droneId, packetDataForSeries);
 
             const latitude = Number(packetDataForSeries.latitude);
             const longitude = Number(packetDataForSeries.longitude);
@@ -751,23 +860,6 @@ function App() {
               }
             }
 
-            setRecordedFlowDataByDrone((previous) => ({
-              ...previous,
-              [droneId]: appendFlowPoint(
-                previous[droneId],
-                packetDataForSeries,
-              ),
-            }));
-
-            if (measurementStatusRef.current === "running") {
-              setMeasurementTraceByDrone((previous) => ({
-                ...previous,
-                [droneId]: appendFlowPoint(
-                  previous[droneId],
-                  packetDataForSeries,
-                ),
-              }));
-            }
           } catch {
             // Ignore malformed websocket payloads.
           }
@@ -784,6 +876,12 @@ function App() {
     });
 
     return () => {
+      if (flushTimer) {
+        window.clearTimeout(flushTimer);
+      }
+
+      flushQueuedTelemetry();
+
       if (reconnectTimer) {
         window.clearTimeout(reconnectTimer);
       }
@@ -1552,7 +1650,7 @@ function App() {
               </div>
 
               <div className="grid w-full gap-3 xl:grid-cols-[1.4fr_0.8fr]">
-                <Map
+                <DeckMap
                   traceDataset={dashboardMapTraceDataset}
                   onScaleChange={setLegendScale}
                   selectedDroneId={selectedDeviceId}

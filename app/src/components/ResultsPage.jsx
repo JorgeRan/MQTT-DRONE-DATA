@@ -35,6 +35,7 @@ import {
 import { AerisPanel } from "./AerisPanel";
 import { MissionModal } from "./MissionModal";
 import { CSVImportModal } from "./CSVModal";
+import { DeckMap } from "./DeckMap";
 
 const ALL_DRONES_OPTION = "ALL";
 const ALL_DATA_MISSION_ID = "ALL_DATA_MISSION";
@@ -2585,7 +2586,7 @@ export function ResultsPage({
             <div className="overflow-hidden rounded-md">
               {selectedMission ? (
                 <div className="relative">
-                  <Map
+                  <DeckMap
                     traceDataset={filteredTraceDataset}
                     onScaleChange={setLegendScale}
                     selectedDroneId={
