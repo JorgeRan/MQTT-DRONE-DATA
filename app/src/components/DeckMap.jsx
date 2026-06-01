@@ -26,11 +26,13 @@ import {
     createTelemetryWebSocket,
     waitForBackendReady,
 } from "../services/api";
+import { normalizeTelemetryPacket } from "../shared/telemetryContract";
 import {
     extractTelemetryMetrics,
     SENSOR_MODE_AERIS,
 } from "../constants/telemetryMetrics";
 import { traceOrigin, buildMethanePlumeDataset } from "../data/methaneTraceData";
+import { buildDeckTracePointsFromFlowData } from "../shared/deckTraceData";
 
 const latitude = traceOrigin.latitude;
 const longitude = traceOrigin.longitude;
@@ -168,98 +170,69 @@ const buildDroneFeatureCollection = (
         })),
 });
 
-const buildDisplayedTraceDataset = (
-    traceDataset,
+const buildDisplayedTracePoints = (
+    tracePoints,
     showTargetMarkers,
     visibleDroneIdSet,
     hasVisibilityFilter,
-) => ({
-    type: "FeatureCollection",
-    features: (traceDataset?.features || [])
-        .filter((feature) =>
-            isDroneVisible(
-                feature?.properties?.droneId,
-                visibleDroneIdSet,
-                hasVisibilityFilter,
-            ),
-        )
-        .map((feature) => {
-            const properties = feature?.properties || {};
-            let nextLongitude;
-            let nextLatitude;
-            let mapCoordinates;
 
-            if (showTargetMarkers) {
-                const targetLongitude = toFiniteNumber(properties.targetLongitude);
-                const targetLatitude = toFiniteNumber(properties.targetLatitude);
-                const isValidTarget =
-                    targetLongitude !== 0 &&
-                    targetLatitude !== 0 &&
-                    Number.isFinite(targetLongitude) &&
-                    Number.isFinite(targetLatitude);
+) => (Array.isArray(tracePoints) ? tracePoints : [])
+    .filter((point) =>
+        isDroneVisible(point?.droneId, visibleDroneIdSet, hasVisibilityFilter),
+    )
+    .map((point) => {
+        let nextLongitude;
+        let nextLatitude;
+        let mapCoordinates;
 
-                if (isValidTarget) {
-                    nextLongitude = targetLongitude;
-                    nextLatitude = targetLatitude;
-                    mapCoordinates = "target";
-                } else {
-                    nextLongitude = toFiniteNumber(properties.sourceLongitude) ?? targetLongitude;
-                    nextLatitude = toFiniteNumber(properties.sourceLatitude) ?? targetLatitude;
-                    mapCoordinates = "drone";
-                }
+        if (showTargetMarkers) {
+            const targetLongitude = toFiniteNumber(point.targetLongitude ?? point.target_longitude);
+            const targetLatitude = toFiniteNumber(point.targetLatitude ?? point.target_latitude);
+            const isValidTarget =
+                targetLongitude !== 0 &&
+                targetLatitude !== 0 &&
+                Number.isFinite(targetLongitude) &&
+                Number.isFinite(targetLatitude);
+
+            if (isValidTarget) {
+                nextLongitude = targetLongitude;
+                nextLatitude = targetLatitude;
+                mapCoordinates = "target";
             } else {
-                nextLongitude = toFiniteNumber(properties.sourceLongitude) ?? toFiniteNumber(properties.targetLongitude);
-                nextLatitude = toFiniteNumber(properties.sourceLatitude) ?? toFiniteNumber(properties.targetLatitude);
+                nextLongitude = toFiniteNumber(point.sourceLongitude ?? point.longitude ?? point.targetLongitude) ?? targetLongitude;
+                nextLatitude = toFiniteNumber(point.sourceLatitude ?? point.latitude ?? point.targetLatitude) ?? targetLatitude;
                 mapCoordinates = "drone";
             }
-
-            if (!Number.isFinite(nextLongitude) || !Number.isFinite(nextLatitude)) {
-                return null;
-            }
-
-            return {
-                ...feature,
-                geometry: {
-                    ...feature.geometry,
-                    coordinates: [nextLongitude, nextLatitude],
-                },
-                properties: {
-                    ...properties,
-                    mapCoordinates,
-                },
-            };
-        })
-        .filter(Boolean),
-});
-
-const getTraceMaxMethane = (dataset) => {
-    if (!dataset?.features?.length) {
-        return 5;
-    }
-
-    let max = 5;
-    for (const feature of dataset.features) {
-        const value = Number(feature?.properties?.methane);
-        if (Number.isFinite(value) && value > max) {
-            max = value;
+        } else {
+            nextLongitude = toFiniteNumber(point.sourceLongitude ?? point.longitude ?? point.targetLongitude);
+            nextLatitude = toFiniteNumber(point.sourceLatitude ?? point.latitude ?? point.targetLatitude);
+            mapCoordinates = "drone";
         }
-    }
 
-    return max;
-};
+        if (!Number.isFinite(nextLongitude) || !Number.isFinite(nextLatitude)) {
+            return null;
+        }
 
-const fitMapToTraceDataset = (map, dataset, { padding = 20, duration = 650, maxZoom = 17 } = {}) => {
-    if (!map || !dataset?.features?.length) {
+        return {
+            ...point,
+            longitude: nextLongitude,
+            latitude: nextLatitude,
+            mapCoordinates,
+        };
+    })
+    .filter(Boolean);
+
+const fitMapToTracePoints = (map, points, { padding = 20, duration = 650, maxZoom = 17 } = {}) => {
+    if (!map || !Array.isArray(points) || points.length === 0) {
         return;
     }
 
     const bounds = new mapboxgl.LngLatBounds();
     let hasValidPoints = false;
 
-    dataset.features.forEach((feature) => {
-        const coordinates = feature?.geometry?.coordinates;
-        const lng = Number(coordinates?.[0]);
-        const lat = Number(coordinates?.[1]);
+    points.forEach((point) => {
+        const lng = Number(point?.longitude);
+        const lat = Number(point?.latitude);
 
         if (Number.isFinite(lng) && Number.isFinite(lat)) {
             bounds.extend([lng, lat]);
@@ -277,6 +250,22 @@ const fitMapToTraceDataset = (map, dataset, { padding = 20, duration = 650, maxZ
         maxZoom,
         essential: true,
     });
+};
+
+const getTraceMaxMethane = (dataset) => {
+    if (!dataset?.features?.length) {
+        return 5;
+    }
+
+    let max = 5;
+    for (const feature of dataset.features) {
+        const value = Number(feature?.properties?.methane);
+        if (Number.isFinite(value) && value > max) {
+            max = value;
+        }
+    }
+
+    return max;
 };
 
 const fitMapToDroneStates = (map, drones, { padding = 60, duration = 700, maxZoom = 17 } = {}) => {
@@ -311,64 +300,9 @@ const fitMapToDroneStates = (map, drones, { padding = 60, duration = 700, maxZoo
     return true;
 };
 
-const buildTracePopupHtml = (feature) => {
-    const properties = feature?.properties || {};
-    const isAerisTrace = properties.sensorMode === SENSOR_MODE_AERIS;
-    // const methane = Number(properties.methane ?? 0).toFixed(2);
-    const hoveredFeature = event.features?.[0];
-
-    if (!hoveredFeature) {
-        return;
-    }
-
-    const {
-        methane,
-        ch4,
-        sniffer,
-        purway,
-        acetylene,
-        nitrousOxide,
-        displayMetricLabel,
-        displayMetricUnits,
-        altitude: pointAltitude,
-        sampleIndex,
-        timeLabel,
-    } = hoveredFeature.properties;
-    return `
-                            <div style="min-width: 148px; color: #e5eef8;">
-                                <div style="font-size: 10px; text-transform: uppercase; letter-spacing: 0.14em; color: #9fb0c2;">Sample ${sampleIndex}</div>
-                                <div style="margin-top: 4px; font-size: 13px; font-weight: 700; color: #ffffff;">${displayMetricLabel || (isAerisTrace ? "CH4" : "Purway")} ${Number(methane ?? 0).toFixed(2)} ${displayMetricUnits || (isAerisTrace ? "ppm" : "ppm-m")}</div>
-                                ${isAerisTrace
-            ? `<div style="margin-top: 2px; font-size: 12px; color: #d2dce8;">CH4 ${Number(ch4 ?? 0).toFixed(2)} ppm</div>`
-            : `<div style="margin-top: 2px; font-size: 12px; color: #d2dce8;">CH4 ${Number(ch4 ?? 0).toFixed(2)} ppm</div>`
-        }
-                                ${isAerisTrace
-            ? `<div style="margin-top: 2px; font-size: 12px; color: #d2dce8;">Acetylene ${Number(acetylene ?? 0).toFixed(2)} ppm</div>
-                                <div style="margin-top: 2px; font-size: 12px; color: #d2dce8;">Nitrous Oxide ${Number(nitrousOxide ?? 0).toFixed(2)} ppm</div>`
-            : `<div style="margin-top: 2px; font-size: 12px; color: #d2dce8;">Sniffer ${Number(sniffer ?? 0).toFixed(2)} ppm</div>
-                                  <div style="margin-top: 2px; font-size: 12px; color: #d2dce8;">Purway ${Number(purway ?? 0).toFixed(2)} ppm-m</div>`
-        }
-                                <div style="margin-top: 4px; font-size: 12px; color: #d2dce8;">Altitude ${Number(pointAltitude).toFixed(0)} m</div>
-                                <div style="margin-top: 2px; font-size: 11px; color: #9fb0c2;">Flight mark ${timeLabel}</div>
-                            </div>
-                        `;
-};
-
-const buildDronePopupHtml = (feature) => {
-    const properties = feature?.properties || {};
-    return `
-    <div style="min-width: 160px; color: #e5eef8;">
-      <div style="font-size: 10px; text-transform: uppercase; letter-spacing: 0.14em; color: #9fb0c2;">${properties.droneId ?? "Drone"}</div>
-      <div style="margin-top: 4px; font-size: 12px; color: #ffffff;">Alt ${Number(properties.altitude ?? 0).toFixed(1)} m</div>
-      <div style="margin-top: 2px; font-size: 12px; color: #d2dce8;">Battery ${properties.battery ?? "-"}%</div>
-      <div style="margin-top: 2px; font-size: 12px; color: #d2dce8;">Speed ${properties.speed ?? "-"} m/s</div>
-      <div style="margin-top: 2px; font-size: 11px; color: #9fb0c2;">${properties.ts ? new Date(properties.ts).toLocaleString() : ""}</div>
-    </div>
-  `;
-};
-
 export function DeckMap({
     traceDataset,
+    tracePoints,
     onScaleChange,
     selectedDroneId,
     visibleDroneIds,
@@ -395,8 +329,12 @@ export function DeckMap({
     const plumeTransitionFrameRef = useRef(null);
     const traceSourceUpdateTimeoutRef = useRef(null);
     const plumeModeFromTiltRef = useRef(plumeViewEnabled);
-
-    const datasetMaxMethane = getTraceMaxMethane(traceDataset);
+    const mapMode = shouldUseOnlineMap(mapboxToken) ? "online" : "offline";
+    const datasetMaxMethane = getTraceMaxMethane(
+        tracePoints && tracePoints.length
+            ? { features: tracePoints.map((point) => ({ properties: { methane: point.methane } })) }
+            : traceDataset,
+    );
     const initialMapSetupRef = useRef(null);
     const [upperLimit, setUpperLimit] = useState(datasetMaxMethane);
     const [lowerLimit, setLowerLimit] = useState(0);
@@ -408,9 +346,6 @@ export function DeckMap({
     const [droneStates, setDroneStates] = useState([]);
     const [, setDroneTrackHistory] = useState({});
     const [isTelemetryConnected, setIsTelemetryConnected] = useState(false);
-    const [mapMode, setMapMode] = useState(() =>
-        shouldUseOnlineMap(mapboxToken) ? "online" : "offline",
-    );
 
     const safeTraceOpacity = Math.min(
         1,
@@ -421,9 +356,18 @@ export function DeckMap({
     const methaneGradient = useMemo(() => buildMethaneGradient(lowerLimit, upperLimit), [lowerLimit, upperLimit]);
     const visibleDroneIdSet = useMemo(() => buildVisibleDroneIdSet(visibleDroneIds), [visibleDroneIds]);
     const hasVisibilityFilter = Array.isArray(visibleDroneIds);
-    const displayedTraceDataset = useMemo(
-        () => buildDisplayedTraceDataset(traceDataset, showTargetMarkers, visibleDroneIdSet, hasVisibilityFilter),
-        [hasVisibilityFilter, showTargetMarkers, traceDataset, visibleDroneIdSet],
+    const tracePointData = useMemo(
+        () => buildDisplayedTracePoints(
+            tracePoints ?? buildDeckTracePointsFromFlowData((traceDataset?.features || []).map((feature) => ({
+                ...(feature?.properties || {}),
+                longitude: feature?.properties?.sourceLongitude ?? feature?.geometry?.coordinates?.[0],
+                latitude: feature?.properties?.sourceLatitude ?? feature?.geometry?.coordinates?.[1],
+            }))),
+            showTargetMarkers,
+            visibleDroneIdSet,
+            hasVisibilityFilter,
+        ),
+        [hasVisibilityFilter, showTargetMarkers, traceDataset, tracePoints, visibleDroneIdSet],
     );
     const methanePlumeDataset = useMemo(
         () => (resultsPageMode ? buildMethanePlumeDataset(traceDataset) : EMPTY_FEATURE_COLLECTION),
@@ -456,18 +400,17 @@ export function DeckMap({
 
     const initialTraceCenter = useMemo(
         () => {
-            const features = displayedTraceDataset?.features || [];
-            if (!features.length) {
+            const points = tracePointData || [];
+            if (!points.length) {
                 return { latitude: displayLatitude, longitude: displayLongitude };
             }
 
             const bounds = new mapboxgl.LngLatBounds();
             let hasValidPoints = false;
 
-            features.forEach((feature) => {
-                const coordinates = feature?.geometry?.coordinates;
-                const lng = Number(coordinates?.[0]);
-                const lat = Number(coordinates?.[1]);
+            points.forEach((point) => {
+                const lng = Number(point?.longitude);
+                const lat = Number(point?.latitude);
                 if (Number.isFinite(lng) && Number.isFinite(lat)) {
                     bounds.extend([lng, lat]);
                     hasValidPoints = true;
@@ -481,7 +424,7 @@ export function DeckMap({
             const center = bounds.getCenter();
             return { latitude: center.lat, longitude: center.lng };
         },
-        [displayLatitude, displayLongitude, displayedTraceDataset],
+        [displayLatitude, displayLongitude, tracePointData],
     );
 
     if (initialMapSetupRef.current === null) {
@@ -493,7 +436,7 @@ export function DeckMap({
             initialCenterLongitude: resultsPageMode
                 ? initialTraceCenter.longitude
                 : displayLongitude,
-            initialDisplayedTraceDataset: displayedTraceDataset,
+            initialDisplayedTracePoints: tracePointData,
             initialIsAutoCenterEnabled: isAutoCenterEnabled,
             initialPlumeViewEnabled: plumeViewEnabled,
             initialResultsPageMode: resultsPageMode,
@@ -568,7 +511,7 @@ export function DeckMap({
     }, [lowerLimit, upperLimit]);
 
     const deckLayers = useMemo(() => {
-        const traceFeatures = displayedTraceDataset?.features || [];
+        const traceFeatures = tracePointData || [];
         const plumeFeatures = methanePlumeDataset?.features || [];
         const liveDroneFeatures = buildDroneFeatureCollection(
             visibleDroneStates,
@@ -599,27 +542,6 @@ export function DeckMap({
         const plumeOpacity = plumeViewEnabled ? 0.82 * safeTraceOpacity : 0;
         const plumeCapsOpacity = plumeViewEnabled ? 0.45 * safeTraceOpacity : 0;
 
-        const setHoverCursor = () => {
-            if (mapRef.current) {
-                mapRef.current.getCanvas().style.cursor = "pointer";
-            }
-        };
-
-        const clearHover = () => {
-            popupRef.current?.remove();
-            if (mapRef.current) {
-                mapRef.current.getCanvas().style.cursor = "";
-            }
-        };
-
-        const showHover = (coordinate, html) => {
-            if (!popupRef.current || !mapRef.current || !coordinate) {
-                return;
-            }
-
-            popupRef.current.setLngLat(coordinate).setHTML(html).addTo(mapRef.current);
-        };
-
         return [
             // new HeatmapLayer({
             //     id: "methane-trace-heatmap",
@@ -642,43 +564,28 @@ export function DeckMap({
             // }),
             new ScatterplotLayer({
                 id: "methane-trace-zero-points",
-                data: traceFeatures.filter((feature) => Number(feature?.properties?.methane ?? 0) === 0),
-                pickable: true,
+                data: traceFeatures.filter((point) => Number(point?.methane ?? 0) === 0),
+                pickable: traceFeatures.length <= 25000,
                 visible: zeroOpacity > 0,
-                getPosition: (feature) => feature.geometry.coordinates,
-                getFillColor: (feature) => hexToRgba(feature?.properties?.pointColor || color.textMuted, 210),
+                getPosition: (point) => [point.longitude, point.latitude],
+                getFillColor: (point) => hexToRgba(point?.pointColor || color.textMuted, 210),
                 getRadius: 3,
                 radiusMinPixels: 2,
                 radiusMaxPixels: 6,
-                _stroked: true,
-                get stroked() {
-                    return this._stroked;
-                },
-                set stroked(value) {
-                    this._stroked = value;
-                },
+                stroked: true,
                 lineWidthMinPixels: 1,
                 getLineColor: [255, 255, 255, 184],
                 opacity: zeroOpacity,
-                onHover: (info) => {
-                    if (!info?.object) {
-                        clearHover();
-                        return;
-                    }
-
-                    setHoverCursor();
-                    showHover(info.coordinate, buildTracePopupHtml(info.object));
-                },
             }),
             new ScatterplotLayer({
                 id: "methane-trace-hotspots",
-                data: traceFeatures.filter((feature) => Number(feature?.properties?.methane ?? 0) > 0),
-                pickable: true,
+                data: traceFeatures.filter((point) => Number(point?.methane ?? 0) > 0),
+                pickable: traceFeatures.length <= 25000,
                 visible: hotspotOpacity > 0,
-                getPosition: (feature) => feature.geometry.coordinates,
-                getFillColor: (feature) => hexToRgba(getScaleColor(feature?.properties?.methane), 220),
-                getRadius: (feature) => {
-                    const methane = Number(feature?.properties?.methane ?? 0);
+                getPosition: (point) => [point.longitude, point.latitude],
+                getFillColor: (point) => hexToRgba(getScaleColor(point?.methane), 220),
+                getRadius: (point) => {
+                    const methane = Number(point?.methane ?? 0);
                     const span = Math.max(upperLimit - lowerLimit, minimumLegendSpan);
                     const ratio = Math.min(Math.max((methane - lowerLimit) / span, 0), 1);
                     return 2.5 + ratio * 4;
@@ -689,25 +596,16 @@ export function DeckMap({
                 lineWidthMinPixels: 1,
                 getLineColor: [255, 255, 255, 230],
                 opacity: hotspotOpacity,
-                onHover: (info) => {
-                    if (!info?.object) {
-                        clearHover();
-                        return;
-                    }
-
-                    setHoverCursor();
-                    showHover(info.coordinate, buildTracePopupHtml(info.object));
-                },
             }),
             new ScatterplotLayer({
                 id: "methane-trace-halo",
-                data: traceFeatures.filter((feature) => Number(feature?.properties?.methane ?? 0) > 0),
+                data: traceFeatures.filter((point) => Number(point?.methane ?? 0) > 0),
                 pickable: false,
                 visible: haloOpacity > 0,
-                getPosition: (feature) => feature.geometry.coordinates,
-                getFillColor: (feature) => hexToRgba(getScaleColor(feature?.properties?.methane), 90),
-                getRadius: (feature) => {
-                    const methane = Number(feature?.properties?.methane ?? 0);
+                getPosition: (point) => [point.longitude, point.latitude],
+                getFillColor: (point) => hexToRgba(getScaleColor(point?.methane), 90),
+                getRadius: (point) => {
+                    const methane = Number(point?.methane ?? 0);
                     const span = Math.max(upperLimit - lowerLimit, minimumLegendSpan);
                     const ratio = Math.min(Math.max((methane - lowerLimit) / span, 0), 1);
                     return 7 + ratio * 9;
@@ -767,15 +665,6 @@ export function DeckMap({
                 lineWidthMinPixels: 1.4,
                 getLineColor: [255, 255, 255, 255],
                 opacity: 0.94,
-                onHover: (info) => {
-                    if (!info?.object) {
-                        clearHover();
-                        return;
-                    }
-
-                    setHoverCursor();
-                    showHover(info.coordinate, buildDronePopupHtml(info.object));
-                },
             }),
             new TextLayer({
                 id: "live-drones-labels",
@@ -793,7 +682,6 @@ export function DeckMap({
             }),
         ];
     }, [
-        displayedTraceDataset,
         getScaleColor,
         hasVisibilityFilter,
         heatmapEnabled,
@@ -805,6 +693,7 @@ export function DeckMap({
         upperLimit,
         visibleDroneIdSet,
         visibleDroneStates,
+        tracePointData,
     ]);
 
     const initialDeckLayersRef = useRef(null);
@@ -865,7 +754,7 @@ export function DeckMap({
             isOnlineMode,
             initialCenterLatitude,
             initialCenterLongitude,
-            initialDisplayedTraceDataset,
+            initialDisplayedTracePoints,
             initialIsAutoCenterEnabled,
             initialPlumeViewEnabled,
             initialResultsPageMode,
@@ -906,8 +795,6 @@ export function DeckMap({
             offset: 14,
             className: "methane-trace-popup",
         });
-        setMapMode(isOnlineMode ? "online" : "offline");
-
         map.addControl(new mapboxgl.NavigationControl(), "top-right");
         map.addControl(overlay);
 
@@ -929,7 +816,7 @@ export function DeckMap({
             }
 
             if (initialResultsPageMode && initialIsAutoCenterEnabled) {
-                fitMapToTraceDataset(map, initialDisplayedTraceDataset, {
+                fitMapToTracePoints(map, initialDisplayedTracePoints, {
                     padding: initialPlumeViewEnabled ? 120 : 20,
                     duration: 0,
                     maxZoom: 18,
@@ -1194,12 +1081,12 @@ export function DeckMap({
 
                 socket.onmessage = (event) => {
                     try {
-                        const packet = JSON.parse(event.data);
-                        if (packet?.type !== "telemetry" || !packet.data) {
+                        const packet = normalizeTelemetryPacket(JSON.parse(event.data));
+                        if (!packet?.telemetry) {
                             return;
                         }
 
-                        upsertDroneState(packet.data);
+                        upsertDroneState(packet.telemetry);
                     } catch {
                         // Ignore malformed packets.
                     }
@@ -1238,7 +1125,7 @@ export function DeckMap({
 
     useEffect(() => {
         onTraceRenderComplete?.();
-    }, [displayedTraceDataset, deckLayers, onTraceRenderComplete]);
+    }, [tracePointData, deckLayers, onTraceRenderComplete]);
 
     //   return (
     //     <div className={tw.panel} style={{ backgroundColor: color.card, padding: "0.5rem" }}>

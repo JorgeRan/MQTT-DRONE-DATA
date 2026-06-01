@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import mapboxgl from "mapbox-gl";
 // import { Map, NavigationControl, Popup, useControl } from "react-map-gl/mapbox";
-import {GeoJsonLayer, ArcLayer} from 'deck.gl';
+import { GeoJsonLayer, ArcLayer } from 'deck.gl';
 import satelliteImage from "../assets/satellite.png";
 import { tw, color } from "../constants/tailwind";
 import {
@@ -25,6 +25,7 @@ import {
   createTelemetryWebSocket,
   waitForBackendReady,
 } from "../services/api";
+import { normalizeTelemetryPacket } from "../shared/telemetryContract";
 import {
   extractTelemetryMetrics,
   SENSOR_MODE_AERIS,
@@ -151,6 +152,49 @@ const buildDroneFeatureCollection = (
     })),
 });
 
+const buildTraceDatasetFromTracePoints = (tracePoints) => {
+  const points = Array.isArray(tracePoints) ? tracePoints : [];
+
+  return {
+    type: "FeatureCollection",
+    features: points
+      .filter((point) => Number.isFinite(Number(point?.longitude)) && Number.isFinite(Number(point?.latitude)))
+      .map((point, index) => ({
+        type: "Feature",
+        geometry: {
+          type: "Point",
+          coordinates: [Number(point.longitude), Number(point.latitude)],
+        },
+        properties: {
+          id: point.id ?? `trace-${point.droneId || "drone"}-${point.timestampMs || point.sampleOrder || index}`,
+          droneId: point.droneId || null,
+          sampleOrder: point.sampleOrder ?? index,
+          sampleIndex: point.sampleIndex ?? index + 1,
+          timestampMs: point.timestampMs,
+          timestampIso: point.timestampIso,
+          timeLabel: point.timeLabel,
+          altitude: point.altitude,
+          sniffer: point.sniffer,
+          purway: point.purway,
+          acetylene: point.acetylene,
+          nitrousOxide: point.nitrousOxide,
+          sensorMode: point.sensorMode,
+          methane: point.methane,
+          methaneValid: point.methaneValid ?? point.methane_valid,
+          displayMetricLabel: point.displayMetricLabel,
+          displayMetricUnits: point.displayMetricUnits,
+          sourceLatitude: Number(point.sourceLatitude ?? point.latitude),
+          sourceLongitude: Number(point.sourceLongitude ?? point.longitude),
+          targetLatitude: Number(point.targetLatitude ?? point.target_latitude ?? point.latitude),
+          targetLongitude: Number(point.targetLongitude ?? point.target_longitude ?? point.longitude),
+          mapCoordinates: point.mapCoordinates ?? point.payload?.map_coordinates ?? "drone",
+          detected: Boolean(point.detected),
+          pointColor: point.pointColor,
+        },
+      })),
+  };
+};
+
 const isAllDroneSelection = (selectedDroneId) => {
   if (selectedDroneId == null) {
     return true;
@@ -249,7 +293,6 @@ const buildDisplayedTraceDataset = (
   showTargetMarkers,
   visibleDroneIdSet,
   hasVisibilityFilter,
-  missionConfiguration = {}
 ) => ({
   type: "FeatureCollection",
   features: (traceDataset?.features || [])
@@ -430,6 +473,7 @@ const fitMapToDroneStates = (
 
 export function Map({
   traceDataset,
+  tracePoints,
   onScaleChange,
   selectedDroneId,
   visibleDroneIds,
@@ -448,7 +492,6 @@ export function Map({
   onTogglePlumeView,
   onPlumeViewAutoChange,
   onTraceRenderComplete,
-  missionConfiguration,
 }) {
   const mapContainerRef = useRef(null);
   const mapRef = useRef(null);
@@ -457,13 +500,20 @@ export function Map({
   const plumeTransitionFrameRef = useRef(null);
   const traceSourceUpdateTimeoutRef = useRef(null);
   const plumeModeFromTiltRef = useRef(plumeViewEnabled);
-  const initialTraceDatasetRef = useRef(traceDataset);
+  const onPlumeViewAutoChangeRef = useRef(onPlumeViewAutoChange);
+  const resolvedTraceDataset = useMemo(
+    () => (Array.isArray(tracePoints) && tracePoints.length > 0
+      ? buildTraceDatasetFromTracePoints(tracePoints)
+      : traceDataset),
+    [traceDataset, tracePoints],
+  );
+  const initialTraceDatasetRef = useRef(resolvedTraceDataset);
   const initialPlumeDatasetRef = useRef(
     resultsPageMode
-      ? buildMethanePlumeDataset(traceDataset)
+      ? buildMethanePlumeDataset(resolvedTraceDataset)
       : EMPTY_FEATURE_COLLECTION,
   );
-  const datasetMaxMethane = getTraceMaxMethane(traceDataset);
+  const datasetMaxMethane = getTraceMaxMethane(resolvedTraceDataset);
   const initialUpperLimitRef = useRef(datasetMaxMethane);
   const initialLowerLimitRef = useRef(0);
   const [upperLimit, setUpperLimit] = useState(datasetMaxMethane);
@@ -471,7 +521,6 @@ export function Map({
   const [upperLimitInput, setUpperLimitInput] = useState(
     String(datasetMaxMethane),
   );
-  const [showTargetSwitch, setShowTargetSwitch] = useState(false);
   const [lowerLimitInput, setLowerLimitInput] = useState("0");
   const [showFlightPath, setShowFlightPath] = useState(false);
   const [showTargetMarkers, setShowTargetMarkers] = useState(false);
@@ -479,9 +528,7 @@ export function Map({
   const [droneStates, setDroneStates] = useState([]);
   const [droneTrackHistory, setDroneTrackHistory] = useState({});
   const [isTelemetryConnected, setIsTelemetryConnected] = useState(false);
-  const [mapMode, setMapMode] = useState(() =>
-    shouldUseOnlineMap(mapboxToken) ? "online" : "offline",
-  );
+  const mapMode = shouldUseOnlineMap(mapboxToken) ? "online" : "offline";
   const methaneScale = buildMethaneScale(lowerLimit, upperLimit);
   const methaneGradient = buildMethaneGradient(lowerLimit, upperLimit);
   const safeTraceOpacity = Math.min(
@@ -494,9 +541,9 @@ export function Map({
   const methanePlumeDataset = useMemo(
     () =>
       resultsPageMode
-        ? buildMethanePlumeDataset(traceDataset)
+        ? buildMethanePlumeDataset(resolvedTraceDataset)
         : EMPTY_FEATURE_COLLECTION,
-    [resultsPageMode, traceDataset],
+    [resultsPageMode, resolvedTraceDataset],
   );
   const visibleDroneIdSet = useMemo(
     () => buildVisibleDroneIdSet(visibleDroneIds),
@@ -506,24 +553,22 @@ export function Map({
   const displayedTraceDataset = useMemo(
     () =>
       buildDisplayedTraceDataset(
-        traceDataset,
+        resolvedTraceDataset,
         showTargetMarkers,
         visibleDroneIdSet,
         hasVisibilityFilter,
-        missionConfiguration
       ),
     [
       hasVisibilityFilter,
       showTargetMarkers,
-      traceDataset,
+      resolvedTraceDataset,
       visibleDroneIdSet,
-      missionConfiguration,
     ],
   );
   const flightPathDataset = useMemo(
     () =>
       resultsPageMode
-        ? buildTraceFlightPathFeatureCollection(traceDataset)
+        ? buildTraceFlightPathFeatureCollection(resolvedTraceDataset)
         : buildLiveFlightPathFeatureCollection(
           droneTrackHistory,
           selectedDroneId,
@@ -535,7 +580,7 @@ export function Map({
       hasVisibilityFilter,
       resultsPageMode,
       selectedDroneId,
-      traceDataset,
+      resolvedTraceDataset,
       visibleDroneIdSet,
     ],
   );
@@ -575,12 +620,21 @@ export function Map({
     : longitude;
   const initialTraceCenter = useMemo(
     () =>
-      getTraceDatasetCenter(traceDataset, {
+      getTraceDatasetCenter(resolvedTraceDataset, {
         latitude: displayLatitude,
         longitude: displayLongitude,
       }),
-    [displayLatitude, displayLongitude, traceDataset],
+    [displayLatitude, displayLongitude, resolvedTraceDataset],
   );
+  const initialMapCenterRef = useRef({
+    latitude: initialTraceCenter.latitude,
+    longitude: initialTraceCenter.longitude,
+  });
+  const initialPlumeViewEnabledRef = useRef(plumeViewEnabled);
+
+  useEffect(() => {
+    onPlumeViewAutoChangeRef.current = onPlumeViewAutoChange;
+  }, [onPlumeViewAutoChange]);
 
   const handleLimitChange = (limitType, rawValue) => {
     const nextValue = rawValue.replace(",", ".");
@@ -633,12 +687,8 @@ export function Map({
     }
 
     const isOnlineMode = shouldUseOnlineMap(mapboxToken);
-    const initialCenterLatitude = resultsPageMode
-      ? initialTraceCenter.latitude
-      : displayLatitude;
-    const initialCenterLongitude = resultsPageMode
-      ? initialTraceCenter.longitude
-      : displayLongitude;
+    const initialCenterLatitude = initialMapCenterRef.current.latitude;
+    const initialCenterLongitude = initialMapCenterRef.current.longitude;
     const offlineCoordinates = buildOfflineImageCoordinates({
       centerLat: initialCenterLatitude,
       centerLon: initialCenterLongitude,
@@ -663,13 +713,6 @@ export function Map({
       attributionControl: false,
     });
 
-    function DeckGLOverlay(props) {
-      const overlay = useControl(() => new DeckOverlay(props));
-      overlay.setProps(props);
-      return null;
-    }
-
-    setMapMode(isOnlineMode ? "online" : "offline");
     mapRef.current = map;
     popupRef.current = new mapboxgl.Popup({
       closeButton: false,
@@ -680,7 +723,7 @@ export function Map({
 
     map.addControl(new mapboxgl.NavigationControl(), "top-right");
 
-    
+
 
     map.on("load", () => {
       if (!isOnlineMode && !resultsPageMode) {
@@ -698,7 +741,7 @@ export function Map({
           maxzoom: 14,
         });
 
-        if (plumeViewEnabled) {
+        if (initialPlumeViewEnabledRef.current) {
           map.setTerrain({ source: "mapbox-dem", exaggeration: 1.35 });
           map.setFog({
             color: "rgba(255, 255, 255, 0.06)",
@@ -961,7 +1004,6 @@ export function Map({
           const {
             methane,
             ch4,
-            averageMethane,
             sniffer,
             purway,
             acetylene,
@@ -1061,16 +1103,6 @@ export function Map({
       });
 
       // Show the target markers switch only if at least one feature has valid, non-zero target coordinates
-      const hasValidTarget = (initialTraceDatasetRef.current?.features || []).some(f => {
-        const p = f.properties || {};
-        const tLon = toFiniteNumber(p.targetLongitude);
-        const tLat = toFiniteNumber(p.targetLatitude);
-        const tAlt = toFiniteNumber(p.targetAltitude);
-        return tLon !== 0 && tLat !== 0 && tAlt !== 0 &&
-          Number.isFinite(tLon) && Number.isFinite(tLat) && Number.isFinite(tAlt);
-      });
-      setShowTargetSwitch(hasValidTarget);
-
       if (resultsPageMode && isAutoCenterEnabled) {
         fitMapToTraceDataset(map, initialTraceDatasetRef.current, {
           padding: 20,
@@ -1092,13 +1124,13 @@ export function Map({
 
           if (!plumeModeFromTiltRef.current && pitch >= 45) {
             plumeModeFromTiltRef.current = true;
-            onPlumeViewAutoChange?.(true);
+            onPlumeViewAutoChangeRef.current?.(true);
             return;
           }
 
           if (plumeModeFromTiltRef.current && pitch <= 25) {
             plumeModeFromTiltRef.current = false;
-            onPlumeViewAutoChange?.(false);
+            onPlumeViewAutoChangeRef.current?.(false);
           }
         };
 
@@ -1120,7 +1152,7 @@ export function Map({
       map.remove();
       mapRef.current = null;
     };
-  }, [resultsPageMode]);
+  }, []);
 
   useEffect(() => {
     if (resultsPageMode) {
@@ -1173,17 +1205,6 @@ export function Map({
     resultsPageMode,
     visibleDroneStates,
   ]);
-
-  useEffect(() => {
-    const nextUpperLimit = Math.max(
-      datasetMaxMethane,
-      lowerLimit + minimumLegendSpan,
-    );
-
-    setUpperLimit(nextUpperLimit);
-    setUpperLimitInput(formatLegendValue(nextUpperLimit));
-    initialUpperLimitRef.current = nextUpperLimit;
-  }, [datasetMaxMethane, lowerLimit]);
 
   useEffect(() => {
     if (traceSourceUpdateTimeoutRef.current) {
@@ -1611,13 +1632,15 @@ export function Map({
 
         socket.onmessage = (event) => {
           try {
-            const packet = JSON.parse(event.data);
-            if (packet?.type !== "telemetry" || !packet.data) {
+            const packet = normalizeTelemetryPacket(JSON.parse(event.data));
+            if (!packet?.telemetry) {
               return;
             }
 
-            upsertDroneState(packet.data);
-          } catch { }
+            upsertDroneState(packet.telemetry);
+          } catch (error) {
+            console.error("Failed to process websocket telemetry:", error);
+          }
         };
       } catch {
         setIsTelemetryConnected(false);
@@ -1709,15 +1732,6 @@ export function Map({
     onScaleChange?.({ lowerLimit, upperLimit });
   }, [lowerLimit, onScaleChange, upperLimit]);
 
-  const drones = ['M350', 'M400-1', 'M400-2'];
-
-  console.log(missionConfiguration['M400-1']);
-  for (let i = 0; i < 2; i++) {
-    if (missionConfiguration[drones[i]] !== undefined) {
-      console.log(`Drone ${drones[i]}:`, missionConfiguration[drones[i]]);
-    }
-
-  }
   return (
     <div
       className={tw.panel}
@@ -1803,7 +1817,25 @@ export function Map({
                       Target Markers
                     </span>
                   </div>
+                  <div
+                    className="flex items-center gap-2 rounded-full border px-2 py-1"
+                    style={{ borderColor: color.border }}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => onTogglePlumeView?.()}
+                      className={`relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-300 ease-in-out focus:outline-none ${plumeViewEnabled ? "bg-green-600" : "bg-gray-300"}`}
+                    >
+                      <span
+                        className={`inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition-transform duration-300 ease-in-out ${plumeViewEnabled ? "translate-x-5" : "translate-x-0"}`}
+                      />
+                    </button>
+                    <span className="text-sm" style={{ color: color.textMuted }}>
+                      Plume View
+                    </span>
+                  </div>
                 </div>
+                
 
               </div>
             </div>
@@ -2123,7 +2155,7 @@ export function Map({
         <div className="flex items-stretch gap-2">
           <div
             ref={mapContainerRef}
-            className={` w-full rounded-lg ${resultsPageMode ? "min-h-[590px]" : "border min-h-[460px]"}`}
+            className={` w-full rounded-lg ${resultsPageMode ? "min-h-[590px]" : "border min-h-[590px]"}`}
             style={resultsPageMode ? undefined : { borderColor: color.border }}
           />
 

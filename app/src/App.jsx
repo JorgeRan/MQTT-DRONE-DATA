@@ -9,33 +9,30 @@ import { MethanePanel } from "./components/MethanePanel";
 import { AerisPanel } from "./components/AerisPanel";
 import { Map } from "./components/Map";
 import { WindPanel } from "./components/WindPanel";
-import { Position } from "./components/3DPosition";
 import { DataPage } from "./components/DataPage";
 import { ResultsPage } from "./components/ResultsPage";
 import { MeasurementControls } from "./components/MeasurementControls";
 import { MissionModal } from "./components/MissionModal";
 import {DeckMap} from "./components/DeckMap";
+import { buildDeckTracePointsFromFlowData } from "./shared/deckTraceData";
+import { DASHBOARD_CHART_POINT_LIMIT, limitSeriesToTail } from "./shared/chartSeries";
 import {
-  filterTraceDatasetBySelection,
   flowChartData,
-  methaneTraceDataset,
 } from "./data/methaneTraceData";
 import {
   calculateDistanceMeters,
-  filterCoordinateOutliers,
   extractTelemetryMetrics,
   getTelemetryPeakValue,
   inferFlowSensorMode,
   SENSOR_MODE_AERIS,
   toFiniteNumber,
 } from "./constants/telemetryMetrics";
+import { normalizeTelemetryPacket } from "./shared/telemetryContract";
 import logoSvg from "./assets/EERL_logo_black.svg";
 import {
   backendHttpUrl,
   createTelemetryWebSocket,
   getMeasurementStatus,
-  pauseMeasurement,
-  resumeMeasurement,
   saveMission,
   syncAndPullData,
   startMeasurement,
@@ -52,6 +49,8 @@ const sensorsMode = [
   { id: "dual", name: "Dual CH4" },
   { id: "aeris", name: "Aeris Box" },
 ];
+
+const EMPTY_FEATURE_COLLECTION = { type: "FeatureCollection", features: [] };
 
 const devices = [
   {
@@ -221,43 +220,6 @@ const getTelemetryWindComponent = (payload, axis) => {
   return 0;
 };
 
-const getTraceDisplayMetric = (point) => {
-  if (point.sensorMode === SENSOR_MODE_AERIS) {
-    const aerisCandidates = [
-      { label: "CH4", units: "ppm", value: toFiniteNumber(point.methane) },
-      {
-        label: "Acetylene",
-        units: "ppm",
-        value: toFiniteNumber(point.acetylene),
-      },
-      {
-        label: "Nitrous Oxide",
-        units: "ppm",
-        value: toFiniteNumber(point.nitrousOxide),
-      },
-    ].filter((candidate) => candidate.value !== null && candidate.value > 0);
-
-    if (aerisCandidates.length) {
-      return aerisCandidates.reduce((best, candidate) =>
-        candidate.value > best.value ? candidate : best,
-      );
-    }
-
-    return { label: "CH4", units: "ppm", value: 0 };
-  }
-
-  const purway = toFiniteNumber(point.purway);
-  if (purway !== null) {
-    return { label: "Purway", units: "ppm-m", value: Math.max(0, purway) };
-  }
-
-  return {
-    label: "CH4",
-    units: "ppm",
-    value: Math.max(0, toFiniteNumber(point.methane) ?? 0),
-  };
-};
-
 const buildFlowDataFromHistory = (historyRows) => {
   const sortedRows = [...historyRows].sort(
     (a, b) => new Date(a.ts || 0).getTime() - new Date(b.ts || 0).getTime(),
@@ -329,57 +291,6 @@ const buildFlowPointFromTelemetry = (telemetryRow, sampleOrder) => {
     payload,
   };
 };
-
-const buildTraceDatasetFromFlowData = (datasetFlowData) => ({
-  type: "FeatureCollection",
-  features: filterCoordinateOutliers(datasetFlowData)
-    .filter((point) => {
-      return Number.isFinite(point.latitude) && Number.isFinite(point.longitude);
-    })
-    // .slice(-5000)
-    .map((point) => {
-      const sourceLatitude = point.latitude;
-      const sourceLongitude = point.longitude;
-      const targetLatitude = point.target_latitude ?? point.payload?.target_latitude ?? null;
-      const targetLongitude = point.target_longitude ?? point.payload?.target_longitude ?? null;
-      const traceDisplayMetric = getTraceDisplayMetric(point);
-      const traceValue = traceDisplayMetric.value;
-      return {
-        type: "Feature",
-        geometry: {
-          type: "Point",
-          coordinates: [sourceLongitude, sourceLatitude],
-        },
-        properties: {
-          id: `trace-${point.droneId || "drone"}-${point.timestampMs || point.sampleOrder}`,
-          droneId: point.droneId || null,
-          sampleOrder: point.sampleOrder,
-          sampleIndex: point.sampleIndex,
-          timestampMs: point.timestampMs,
-          timestampIso: point.timestampIso,
-          timeLabel: point.time,
-          altitude: point.altitude,
-          sniffer: point.sniffer,
-          purway: point.purway,
-          acetylene: point.acetylene,
-          nitrousOxide: point.nitrousOxide,
-          sensorMode: point.sensorMode,
-          ch4: point.methane,
-          methane: traceValue,
-          methaneValid: getTelemetryMethaneValidity(point),
-          displayMetricLabel: traceDisplayMetric.label,
-          displayMetricUnits: traceDisplayMetric.units,
-          sourceLatitude,
-          sourceLongitude,
-          targetLatitude,
-          targetLongitude,
-          mapCoordinates: point.payload?.map_coordinates === "target" ? "target" : "drone",
-          detected: traceValue > 0,
-          pointColor: traceValue > 0 ? "#4ade80" : "#64748b",
-        },
-      };
-    }),
-});
 
 const appendFlowPoints = (series, telemetryRows, options = {}) => {
   const existingSeries = series || [];
@@ -529,7 +440,7 @@ function App() {
   const [deleteHoldProgress, setDeleteHoldProgress] = useState(0);
   const deleteHoldRafRef = useRef(null);
 
-  const [telemetrySource, setTelemetrySource] = useState("MQTT");
+  const [TELEMETRY_SOURCE, setTelemetrySource] = useState("MQTT");
   const [showDashboardPlotData, setShowDashboardPlotData] = useState(true);
   const [methaneValidityVisibility, setMethaneValidityVisibility] = useState({
     valid: true,
@@ -542,20 +453,7 @@ function App() {
       return accumulator;
     }, {}),
   );
-  const [legendScale, setLegendScale] = useState({
-    lowerLimit: 0,
-    upperLimit: 5,
-  });
-  const measurementTraceData = useMemo(
-    () => measurementTraceByDrone[selectedDeviceId] || [],
-    [measurementTraceByDrone, selectedDeviceId],
-  );
-
-  const recordedFlowData = useMemo(
-    () => recordedFlowDataByDrone[selectedDeviceId] || [],
-    [recordedFlowDataByDrone, selectedDeviceId],
-  );
-
+  const [plumeViewEnabled, setPlumeViewEnabled] = useState(false);
   const liveFlowData = useMemo(() => {
     const selectedDroneData = liveTelemetryByDrone[selectedDeviceId];
     if (Array.isArray(selectedDroneData) && selectedDroneData.length > 0) {
@@ -573,14 +471,6 @@ function App() {
     return flowChartData;
   }, [liveTelemetryByDrone, recordedFlowDataByDrone, selectedDeviceId]);
 
-  const filteredMeasurementTraceData = useMemo(
-    () =>
-      measurementTraceData.filter((point) =>
-        shouldIncludeMethaneValidity(point, methaneValidityVisibility),
-      ),
-    [measurementTraceData, methaneValidityVisibility],
-  );
-
   const filteredLiveFlowData = useMemo(
     () =>
       liveFlowData.filter((point) =>
@@ -588,17 +478,26 @@ function App() {
       ),
     [liveFlowData, methaneValidityVisibility],
   );
+  const dashboardChartFlowData = useMemo(
+    () => limitSeriesToTail(filteredLiveFlowData, DASHBOARD_CHART_POINT_LIMIT),
+    [filteredLiveFlowData],
+  );
 
   const maxSelectablePpm = Math.max(
     fallbackMaxSelectablePpm,
     getTelemetryPeakValue(filteredLiveFlowData),
   );
-  const [selectedWindow, setSelectedWindow] = useState({
-    startIndex: 0,
-    endIndex: filteredLiveFlowData.length - 1,
-    ppmMin: 0,
-    ppmMax: fallbackMaxSelectablePpm,
-  });
+  const defaultSelectedWindow = useMemo(
+    () => ({
+      startIndex: 0,
+      endIndex: Math.max(0, dashboardChartFlowData.length - 1),
+      ppmMin: 0,
+      ppmMax: maxSelectablePpm,
+    }),
+    [dashboardChartFlowData.length, maxSelectablePpm],
+  );
+  const [selectedWindowOverride, setSelectedWindow] = useState(null);
+  const selectedWindow = selectedWindowOverride ?? defaultSelectedWindow;
 
   useEffect(() => {
     let isCancelled = false;
@@ -769,8 +668,10 @@ function App() {
 
         socket.onmessage = (event) => {
           try {
-            const packet = JSON.parse(event.data);
-            if (packet?.type !== "telemetry" || !packet.data?.drone_id) {
+            const packet = normalizeTelemetryPacket(JSON.parse(event.data));
+            const packetDataForSeries = packet?.telemetry;
+
+            if (!packetDataForSeries?.droneId && !packetDataForSeries?.drone_id) {
               return;
             }
 
@@ -778,12 +679,11 @@ function App() {
               return;
             }
 
-            const droneId = packet.data.drone_id;
-            const packetDataForSeries = packet.data;
+            const droneId = packetDataForSeries.drone_id || packetDataForSeries.droneId;
             const source =
-              packet.source === "UDP"
+              packet?.source === "UDP"
                 ? "UDP"
-                : packet.source === "MQTT"
+                : packet?.source === "MQTT"
                   ? "MQTT"
                   : null;
 
@@ -893,29 +793,6 @@ function App() {
     };
   }, []);
 
-  useEffect(() => {
-    setSelectedWindow({
-      startIndex: 0,
-      endIndex: Math.max(0, filteredLiveFlowData.length - 1),
-      ppmMin: 0,
-      ppmMax: maxSelectablePpm,
-    });
-  }, [filteredLiveFlowData, maxSelectablePpm]);
-
-  const activeTraceDataset = useMemo(
-    () =>
-      buildTraceDatasetFromFlowData(
-        filteredMeasurementTraceData.length > 0
-          ? filteredMeasurementTraceData
-          : filteredLiveFlowData,
-      ),
-    [filteredMeasurementTraceData, filteredLiveFlowData],
-  );
-
-  const filteredTraceDataset = useMemo(
-    () => filterTraceDatasetBySelection(activeTraceDataset, selectedWindow),
-    [activeTraceDataset, selectedWindow],
-  );
   const visibleDashboardDroneIds = useMemo(() => {
     if (!showDashboardPlotData) {
       return [];
@@ -925,9 +802,9 @@ function App() {
       .filter((device) => dashboardDroneVisibility[device.id] !== false)
       .map((device) => device.id);
   }, [dashboardDroneVisibility, showDashboardPlotData]);
-  const dashboardMapTraceDataset = useMemo(
+  const dashboardMapTracePoints = useMemo(
     () =>
-      buildTraceDatasetFromFlowData(
+      buildDeckTracePointsFromFlowData(
         buildCombinedFlowDataForDrones({
           devices,
           measurementTraceByDrone,
@@ -949,12 +826,12 @@ function App() {
 
   const windSamples = useMemo(
     () =>
-      filteredLiveFlowData.map((point) => ({
+      dashboardChartFlowData.map((point) => ({
         u: point.wind_u ?? 0,
         v: point.wind_v ?? 0,
         w: point.wind_w ?? 0,
       })),
-    [filteredLiveFlowData],
+    [dashboardChartFlowData],
   );
 
   const latestPointByDrone = useMemo(() => {
@@ -1080,12 +957,10 @@ function App() {
   }, []);
   const missionDroneIds = useMemo(
     () =>
-      devices
-        .map((device) => device.id)
-        .filter(
-          (droneId) => (measurementTraceByDrone[droneId] || []).length > 0,
-        ),
-    [devices, measurementTraceByDrone],
+      Object.keys(measurementTraceByDrone).filter(
+        (droneId) => (measurementTraceByDrone[droneId] || []).length > 0,
+      ),
+    [measurementTraceByDrone],
   );
 
   useEffect(() => {
@@ -1119,39 +994,6 @@ function App() {
       window.clearInterval(intervalId);
     };
   }, []);
-
-  const handleStartMeasurement = async () => {
-    setMeasurementBusy(true);
-    setMeasurementTraceByDrone({});
-    setMissionName("");
-    setContinuingMission(null);
-    const status = await startMeasurement();
-    if (status) {
-      setMeasurementStatus(status.status);
-      setMeasurementElapsedSeconds(status.elapsedSeconds);
-    }
-    setMeasurementBusy(false);
-  };
-
-  const handlePauseMeasurement = async () => {
-    setMeasurementBusy(true);
-    const status = await pauseMeasurement();
-    if (status) {
-      setMeasurementStatus(status.status);
-      setMeasurementElapsedSeconds(status.elapsedSeconds);
-    }
-    setMeasurementBusy(false);
-  };
-
-  const handleResumeMeasurement = async () => {
-    setMeasurementBusy(true);
-    const status = await resumeMeasurement();
-    if (status) {
-      setMeasurementStatus(status.status);
-      setMeasurementElapsedSeconds(status.elapsedSeconds);
-    }
-    setMeasurementBusy(false);
-  };
 
   const handleDiscardMeasurement = async () => {
     setMeasurementBusy(true);
@@ -1649,10 +1491,11 @@ function App() {
 
               </div>
 
-              <div className="grid w-full gap-3 xl:grid-cols-[1.4fr_0.8fr]">
-                <DeckMap
-                  traceDataset={dashboardMapTraceDataset}
-                  onScaleChange={setLegendScale}
+              {/* <div className="grid w-full gap-3 xl:grid-cols-[1.4fr_0.8fr]"> */}
+               <div className="grid w-full gap-3 ">
+                <Map
+                  traceDataset={EMPTY_FEATURE_COLLECTION}
+                  tracePoints={dashboardMapTracePoints}
                   selectedDroneId={selectedDeviceId}
                   visibleDroneIds={visibleDashboardDroneIds}
                   devices={devices}
@@ -1666,28 +1509,17 @@ function App() {
                   onToggleMethaneValidity={
                     handleToggleMethaneValidityVisibility
                   }
+                  plumeViewEnabled={plumeViewEnabled}
+                  onTogglePlumeView={() =>
+                    setPlumeViewEnabled((previous) => !previous)
+                  }
                   resultsPageMode={false}
-                  missionConfiguration={{
-                    ...(devices.reduce((acc, d) => {
-                      acc[d.id] = activeSensorMode;
-                      return acc;
-                    }, {})),
-                  }}
-                />
-                <Position
-                  traceDataset={filteredTraceDataset}
-                  lowerLimit={legendScale.lowerLimit}
-                  upperLimit={legendScale.upperLimit}
-                  selectedDroneId={selectedDeviceId}
-                  focusCoordinates={[
-                    activePoint?.longitude,
-                    activePoint?.latitude,
-                  ]}
+                  onPlumeViewAutoChange={setPlumeViewEnabled}
                 />
               </div>
               {selectedDeviceId === "Aeris" ? (
                 <AerisPanel
-                  flowData={filteredLiveFlowData}
+                  flowData={dashboardChartFlowData}
                   selection={selectedWindow}
                   onSelectionChange={setSelectedWindow}
                   resultsPageMode={false}
@@ -1695,7 +1527,7 @@ function App() {
               ) : (
                 <div className="grid w-full gap-3 xl:grid-cols-[1.4fr_0.8fr]">
                   <MethanePanel
-                    flowData={filteredLiveFlowData}
+                    flowData={dashboardChartFlowData}
                     selection={selectedWindow}
                     onSelectionChange={setSelectedWindow}
                     resultsPageMode={false}

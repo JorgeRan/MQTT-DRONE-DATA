@@ -6,7 +6,7 @@ dotenv.config();
 const brokerUrl = process.env.MQTT_BROKER_URL || 'mqtts://1ff7f31f358d46628258e87380e60321.s1.eu.hivemq.cloud:8883';
 const mqttUsername = process.env.MQTT_USERNAME || 'EERL-MQTT';
 const mqttPassword = process.env.MQTT_PASSWORD || 'CH4Drone';
-const publishIntervalMs = Number(process.env.SIM_INTERVAL_MS || 100);
+const publishIntervalMs = Number(process.env.SIM_INTERVAL_MS || 1000);
 const simulatorVerbose = process.env.SIM_VERBOSE === 'true';
 const summaryEveryTicks = Math.max(1, Number(process.env.SIM_LOG_EVERY_TICKS || 5));
 
@@ -67,8 +67,9 @@ const updateDrone = (drone) => {
     const radians = (drone.heading * Math.PI) / 180;
 
     drone.sniffer_ppm = Math.max(0, 1.2 + Math.sin(Date.now() / 3500 + radians) * 0.8 + jitter(0.2));
-    drone.purway_ppn = Math.max(0, 86 + Math.sin(Date.now() / 4200 + radians) * 6 + jitter(1.2));
-    
+    // drone.purway_ppn = Math.max(0, 86 + Math.sin(Date.now() / 4200 + radians) * 6 + jitter(1.2));
+    drone.purway_ppn = 80;
+
     drone.wind_u = Math.sin(radians) * 0.9 + jitter(0.08);
     drone.wind_v = Math.cos(radians) * 0.9 + jitter(0.08);
     drone.wind_w = Math.sin(Date.now() / 5000 + radians) * 0.3 + jitter(0.04);
@@ -98,31 +99,41 @@ const publishTick = () => {
             methane: Number(drone.sniffer_ppm.toFixed(3)),
             sniffer_ppm: Number(drone.sniffer_ppm.toFixed(3)),
             purway_ppn: Number(drone.purway_ppn.toFixed(2)),
+            flightStatus: 2,
             target_latitude: Number((drone.lat + 0.0005).toFixed(7)),
             target_longitude: Number((drone.lon + 0.0005).toFixed(7)),
             wind_u: Number(drone.wind_u.toFixed(3)),
             wind_v: Number(drone.wind_v.toFixed(3)),
             wind_w: Number(drone.wind_w.toFixed(3)),
-            payload: {
-                simulator: true,
-                flight_status: 2,
-                droneId: drone.droneId,
-                drone_id: drone.droneId,
-                timestamp: new Date().toISOString(),
-                latitude: Number(drone.lat.toFixed(7)),
-                longitude: Number(drone.lon.toFixed(7)),
-                altitude: Number(drone.altitude.toFixed(1)),
-                sniffer_ppm: Number(drone.sniffer_ppm.toFixed(3)),
-                purway_ppn: Number(drone.purway_ppn.toFixed(2)),
-                target_latitude: Number((drone.lat + 0.0005).toFixed(7)),
-                target_longitude: Number((drone.lon + 0.0005).toFixed(7)),
-                wind_u: Number(drone.wind_u.toFixed(3)),
-                wind_v: Number(drone.wind_v.toFixed(3)),
-                wind_w: Number(drone.wind_w.toFixed(3)),
-            },
-        };
 
-        client.publish(drone.topic, JSON.stringify(payload), { qos: 1 }, (error) => {
+        };
+        // Field order: [timestamp, methane, sniffer_methane, distance, latitude, longitude, altitude, targ_latitude, targ_longitude, wind_x, wind_y, wind_z, methane_valid, flight_status]
+
+        const payloadArray = {
+            d: drone.droneId,
+            topic: drone.topic,
+            b: Array.from({ length: 11 }, (_, index) => {
+                const offset = (index + 1) * 0.0001;
+                return [
+                    payload.timestamp,
+                    80,
+                    payload.sniffer_ppm,
+                    payload.distance,
+                    payload.latitude + offset,
+                    payload.longitude + offset,
+                    payload.altitude + offset,
+                    payload.target_latitude,
+                    payload.target_longitude,
+                    payload.wind_u,
+                    payload.wind_v,
+                    payload.wind_w,
+                    payload.methane_valid ?? 1,
+                    payload.flight_status,
+                ];
+            }),
+        }
+
+        client.publish(drone.topic, JSON.stringify(payloadArray), { qos: 1 }, (error) => {
             if (error) {
                 console.error(`Publish failed for ${drone.droneId}:`, error.message);
                 return;

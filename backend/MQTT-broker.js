@@ -14,6 +14,7 @@ import { fileURLToPath } from "node:url";
 import { SerialPort } from "serialport";
 import { WebSocketServer } from "ws";
 import sql from "./db.js";
+import { buildTelemetryEnvelope } from "./src/shared/telemetryContract.js";
 import { createRemoteMissionStore } from "./remoteMissionStore.js";
 import { createRemoteTelemetryStore } from "./remoteTelemetryStore.js";
 
@@ -1483,11 +1484,19 @@ const broadcastTelemetry = (
   { includeMetrics = true } = {},
   source,
 ) => {
-  const packet = JSON.stringify({
-    type: "telemetry",
-    source: source,
-    data: telemetryToClientPayload(telemetry, includeMetrics),
-  });
+  const packetObject = buildTelemetryEnvelope(
+    telemetryToClientPayload(telemetry, includeMetrics),
+    {
+      includeMetrics,
+      source,
+    },
+  );
+
+  if (!packetObject) {
+    return;
+  }
+
+  const packet = JSON.stringify(packetObject);
 
   for (const socket of wss.clients) {
     if (socket.readyState === socket.OPEN) {

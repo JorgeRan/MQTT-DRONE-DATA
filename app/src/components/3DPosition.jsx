@@ -4,35 +4,53 @@ import { tw, color } from '../constants/tailwind'
 import { buildMethaneColorExpression } from '../constants/methaneScale'
 import satelliteImage from '../assets/satellite.png'
 import { buildOfflineImageCoordinates, buildOfflineSatelliteStyle, shouldUseOnlineMap } from '../constants/offlineMap'
-import {
-  buildMethanePlumeDataset,
-  traceOrigin,
-} from '../data/methaneTraceData'
+import { traceOrigin } from '../data/methaneTraceData'
+import { buildMethanePlumeDatasetFromPoints } from '../shared/deckTraceData'
 
 const latitude = traceOrigin.latitude
 const longitude = traceOrigin.longitude
 const mapboxToken = import.meta.env.VITE_MAPBOX_TOKEN
 
-export function Position({ traceDataset, lowerLimit = 0, upperLimit = 5, selectedDroneId, focusCoordinates }) {
+export function Position({ traceDataset, tracePoints, lowerLimit = 0, upperLimit = 5, selectedDroneId, focusCoordinates }) {
   const mapContainerRef = useRef(null)
   const mapRef = useRef(null)
-  const initialPlumeDatasetRef = useRef(buildMethanePlumeDataset(traceDataset))
+  const resolvedTracePoints = Array.isArray(tracePoints) && tracePoints.length > 0
+    ? tracePoints
+    : traceDataset.features.map((feature) => ({
+        sampleOrder: feature?.properties?.sampleOrder,
+        sampleIndex: feature?.properties?.sampleIndex,
+        timestampMs: feature?.properties?.timestampMs,
+        timestampIso: feature?.properties?.timestampIso,
+        timeLabel: feature?.properties?.timeLabel,
+        altitude: feature?.properties?.altitude,
+        methane: feature?.properties?.methane,
+        sensorMode: feature?.properties?.sensorMode,
+        purway: feature?.properties?.purway,
+        sniffer: feature?.properties?.sniffer,
+        acetylene: feature?.properties?.acetylene,
+        nitrousOxide: feature?.properties?.nitrousOxide,
+        longitude: feature?.geometry?.coordinates?.[0],
+        latitude: feature?.geometry?.coordinates?.[1],
+        pointColor: feature?.properties?.pointColor,
+        payload: feature?.properties?.payload,
+      }))
+  const initialPlumeDatasetRef = useRef(buildMethanePlumeDatasetFromPoints(resolvedTracePoints))
   const initialLowerLimitRef = useRef(lowerLimit)
   const initialUpperLimitRef = useRef(upperLimit)
-  const methanePlumeDataset = useMemo(() => buildMethanePlumeDataset(traceDataset), [traceDataset])
+  const methanePlumeDataset = useMemo(() => buildMethanePlumeDatasetFromPoints(resolvedTracePoints), [resolvedTracePoints])
   const methanePositiveCount = useMemo(
-    () => traceDataset.features.filter((feature) => feature.properties.methane > 0).length,
-    [traceDataset],
+    () => resolvedTracePoints.filter((point) => Number(point?.methane ?? 0) > 0).length,
+    [resolvedTracePoints],
   )
   const methanePeakValue = useMemo(
-    () => Math.max(0, ...traceDataset.features.map((feature) => feature.properties.methane)),
-    [traceDataset],
+    () => Math.max(0, ...resolvedTracePoints.map((point) => Number(point?.methane ?? 0))),
+    [resolvedTracePoints],
   )
   const traceMetricMeta = useMemo(() => {
     const sensorModes = Array.from(
       new Set(
-        (traceDataset.features || [])
-          .map((feature) => feature?.properties?.sensorMode)
+        resolvedTracePoints
+          .map((point) => point?.sensorMode)
           .filter(Boolean),
       ),
     )
@@ -55,26 +73,27 @@ export function Position({ traceDataset, lowerLimit = 0, upperLimit = 5, selecte
       label: 'trace detections extruded',
       unit: 'mixed units',
     }
-  }, [traceDataset])
+  }, [resolvedTracePoints])
   const selectedFocusCoordinates = useMemo(() => {
     const [liveLng, liveLat] = Array.isArray(focusCoordinates) ? focusCoordinates : []
     if (Number.isFinite(liveLat) && Number.isFinite(liveLng)) {
       return [liveLng, liveLat]
     }
 
-    if (!Array.isArray(traceDataset.features) || traceDataset.features.length === 0) {
+    if (!Array.isArray(resolvedTracePoints) || resolvedTracePoints.length === 0) {
       return [longitude, latitude]
     }
 
-    const lastFeature = traceDataset.features[traceDataset.features.length - 1]
-    const [lng, lat] = lastFeature?.geometry?.coordinates || [longitude, latitude]
+    const lastPoint = resolvedTracePoints[resolvedTracePoints.length - 1]
+    const lng = Number(lastPoint?.longitude)
+    const lat = Number(lastPoint?.latitude)
 
     if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
       return [longitude, latitude]
     }
 
     return [lng, lat]
-  }, [focusCoordinates, traceDataset])
+  }, [focusCoordinates, resolvedTracePoints])
 
   useEffect(() => {
     if (!mapContainerRef.current || mapRef.current) {
